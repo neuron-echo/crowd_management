@@ -1,0 +1,22 @@
+dataset:
+  name: HAJJv2
+  root: HAJJv2.Dataset
+
+ingestion:
+  target_fps: 5
+  real_time_mode: true
+  buffer_size: 30
+  drop_policy: oldest
+
+cameras:
+  - camera_id: cam_01
+    name: Hajj Video 01
+    source_type: video
+    source: HAJJv2.Dataset/Testing/Videos/2.mp4
+    enabled: true
+
+  - camera_id: cam_02
+    name: Hajj Video 02
+    source_type: video
+    source: HAJJv2.Dataset/Testing/Videos/3.mp4
+    enabled: true

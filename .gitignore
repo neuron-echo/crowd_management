@@ -1,0 +1,115 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# ─── Distribution / packaging ─────────────────────────────────────────────────
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.conda/
+
+# ─── Testing & coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+nosetests.xml
+test-results/
+
+# ─── Type checking ────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+.pyrefly/
+pyrightconfig.json
+
+# ─── IDEs & editors ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── PyTorch / ML model weights & checkpoints ────────────────────────────────
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.hdf5
+*.onnx
+*.pb
+checkpoints/
+saved_models/
+model_weights/
+
+# ─── Dataset (HAJJv2) ─────────────────────────────────────────────────────────
+# Raw video files and annotations are large binary assets, not tracked in git.
+# Download / symlink them locally according to README instructions.
+HAJJv2.Dataset/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ─── Pipeline outputs ─────────────────────────────────────────────────────────
+outputs/
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Environment / secrets ────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.yaml
+secrets.yml
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+.cache/
