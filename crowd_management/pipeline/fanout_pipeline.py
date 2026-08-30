@@ -46,6 +46,7 @@ class FanOutPipeline:
 
         # Vision models
         self.model_manager = model_manager or ModelManager(
+            models_config=self.config.models,
             csrnet_resolution=csrnet_resolution,
             raft_resolution=raft_resolution,
         )

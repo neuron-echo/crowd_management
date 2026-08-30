@@ -1,0 +1,31 @@
+# Circular Demo Venue Configuration (Production / Baseline Profile)
+#
+# Configures the active observed gates corresponding to enabled cameras:
+# cam_01 -> G1
+# cam_02 -> G2
+#
+# Circular topology automatically establishes bidirectional connections:
+# G1 <-> G2 (arc length = pi * radius = 314.16m)
+
+venue:
+  id: demo_venue
+  name: Circular Demo Venue
+
+  geometry:
+    type: circular
+    radius_m: 100
+
+  auto_circular_connections: true
+
+  gates:
+    - gate_id: G1
+      name: Gate North
+      capacity: 500
+      position_index: 0
+      camera_id: cam_01
+
+    - gate_id: G2
+      name: Gate East
+      capacity: 600
+      position_index: 1
+      camera_id: cam_02

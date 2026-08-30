@@ -1,4 +1,4 @@
-"""RAFT optical flow inference and crowd motion analytics engine."""
+"""RAFT optical flow inference and crowd motion analytics engine with robust statistics."""
 
 from __future__ import annotations
 
@@ -23,8 +23,9 @@ class RAFTInference:
         model_size: str = "large",
         inference_resolution: tuple[int, int] | None = (512, 384),
         model_name: str | None = None,
+        motion_threshold_px: float = 0.5,
     ) -> None:
-        if device is None:
+        if device is None or device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
@@ -32,6 +33,7 @@ class RAFTInference:
         self.model_size = model_size
         self.inference_resolution = inference_resolution  # (width, height)
         self.model_name = model_name or f"torchvision-raft-{model_size}"
+        self.motion_threshold_px = motion_threshold_px
 
         # Load official torchvision RAFT
         if model_size == "small":
@@ -84,7 +86,7 @@ class RAFTInference:
             curr_packet: FramePacket at time t
 
         Returns:
-            Immutable RAFTResult with computed velocity and direction statistics.
+            Immutable RAFTResult with computed robust velocity and direction statistics.
         """
         if prev_packet.camera_id != curr_packet.camera_id:
             raise ValueError(
@@ -100,7 +102,7 @@ class RAFTInference:
         img1, (pw1, ph1), (orig_w, orig_h) = self._preprocess_frame(prev_packet.frame)
         img2, _, _ = self._preprocess_frame(curr_packet.frame)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             list_of_flows = self.model(img1, img2)
             flow_tensor = list_of_flows[-1]  # Final predicted flow (1, 2, H, W)
 
@@ -109,25 +111,20 @@ class RAFTInference:
         u_flow = flow_np[0]
         v_flow = flow_np[1]
 
-        # Rescale optical flow values to native resolution coordinates if resized
-        scale_x = orig_w / float(pw1)
-        scale_y = orig_h / float(ph1)
-        u_flow_scaled = u_flow * scale_x
-        v_flow_scaled = v_flow * scale_y
+        # Velocity magnitude in pixels/frame at inference resolution (512x384)
+        magnitude = np.sqrt(u_flow**2 + v_flow**2)
 
-        # Velocity magnitude in pixels/frame
-        magnitude = np.sqrt(u_flow_scaled**2 + v_flow_scaled**2)
-
-        # Velocity statistics
+        # Robust velocity statistics (in px/frame at inference resolution)
         avg_velocity = float(np.mean(magnitude))
         median_velocity = float(np.median(magnitude))
+        p90_velocity = float(np.percentile(magnitude, 90))
+        p95_velocity = float(np.percentile(magnitude, 95))
         max_velocity = float(np.max(magnitude))
         velocity_var = float(np.var(magnitude))
 
-        # Direction angle in degrees: 0° to 360° (0° = Right/East, 90° = Down/South, 180° = Left/West, 270° = Up/North)
-        # Vector sum for dominant direction
-        u_sum = float(np.sum(u_flow_scaled))
-        v_sum = float(np.sum(v_flow_scaled))
+        # Vector sum for dominant direction (0° = Right/East, 90° = Down/South, 180° = Left/West, 270° = Up/North)
+        u_sum = float(np.sum(u_flow))
+        v_sum = float(np.sum(v_flow))
         dom_rad = np.arctan2(v_sum, u_sum)
         dominant_deg = float(np.degrees(dom_rad) % 360.0)
 
@@ -137,19 +134,22 @@ class RAFTInference:
         flow_consistency = float(vector_sum_mag / (sum_mag + 1e-6))
         flow_consistency = float(np.clip(flow_consistency, 0.0, 1.0))
 
-        # Active motion ratio (motion > 0.5 pixels)
-        active_motion_pixels = np.count_nonzero(magnitude > 0.5)
+        # Active motion ratio (motion > motion_threshold_px)
+        active_motion_pixels = np.count_nonzero(magnitude > self.motion_threshold_px)
         active_motion_ratio = float(active_motion_pixels / float(magnitude.size))
 
         # Motion confidence score
         motion_confidence = float(np.clip(active_motion_ratio * (0.5 + 0.5 * flow_consistency), 0.0, 1.0))
 
+        # Delta time calculation (seconds)
+        delta_time = max(1e-5, float(curr_packet.video_timestamp - prev_packet.video_timestamp))
+
         inference_time_ms = (time.perf_counter() - start_time) * 1000.0
 
-        # Downsample flow field (e.g. 32x24 grid) for lightweight visual inspection
+        # Downsample flow field (32x24 grid) for lightweight visual inspection
         summary_grid_w, summary_grid_h = 32, 24
-        u_summary = cv2.resize(u_flow_scaled, (summary_grid_w, summary_grid_h), interpolation=cv2.INTER_AREA)
-        v_summary = cv2.resize(v_flow_scaled, (summary_grid_w, summary_grid_h), interpolation=cv2.INTER_AREA)
+        u_summary = cv2.resize(u_flow, (summary_grid_w, summary_grid_h), interpolation=cv2.INTER_AREA)
+        v_summary = cv2.resize(v_flow, (summary_grid_w, summary_grid_h), interpolation=cv2.INTER_AREA)
         flow_summary = np.stack([u_summary, v_summary], axis=-1)  # (24, 32, 2)
 
         return RAFTResult(
@@ -160,10 +160,14 @@ class RAFTInference:
             current_source_frame_index=curr_packet.source_frame_index,
             previous_timestamp=prev_packet.video_timestamp,
             current_timestamp=curr_packet.video_timestamp,
-            flow_width=orig_w,
-            flow_height=orig_h,
+            delta_time=delta_time,
+            flow_width=pw1,
+            flow_height=ph1,
             average_velocity=avg_velocity,
+            mean_velocity=avg_velocity,
             median_velocity=median_velocity,
+            p90_velocity=p90_velocity,
+            p95_velocity=p95_velocity,
             max_velocity=max_velocity,
             velocity_variance=velocity_var,
             dominant_direction_deg=dominant_deg,
@@ -173,5 +177,6 @@ class RAFTInference:
             inference_time_ms=inference_time_ms,
             model_name=self.model_name,
             device=self.device,
+            result_timestamp=time.time(),
             flow_summary=flow_summary,
         )

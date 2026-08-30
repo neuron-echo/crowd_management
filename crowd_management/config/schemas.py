@@ -33,10 +33,30 @@ class IngestionConfig(BaseModel):
         return self
 
 
+class CSRNetModelConfig(BaseModel):
+    enabled: bool = True
+    checkpoint_path: str = "checkpoints/csrnet_shanghaitech_part_a.pth"
+    inference_resolution: tuple[int, int] | None = (720, 540)
+
+
+class RAFTModelConfig(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    enabled: bool = True
+    model_size: Literal["small", "large"] = "large"
+    inference_resolution: tuple[int, int] | None = (512, 384)
+
+
+class ModelsConfig(BaseModel):
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    csrnet: CSRNetModelConfig = Field(default_factory=CSRNetModelConfig)
+    raft: RAFTModelConfig = Field(default_factory=RAFTModelConfig)
+
+
 class AppConfig(BaseModel):
     dataset: DatasetConfig
     ingestion: IngestionConfig
     cameras: list[CameraConfig] = Field(default_factory=list)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
 
     @model_validator(mode="after")
     def validate_cameras(self):
@@ -44,3 +64,4 @@ class AppConfig(BaseModel):
         if not enabled_cameras:
             raise ValueError("At least one enabled camera must be defined")
         return self
+

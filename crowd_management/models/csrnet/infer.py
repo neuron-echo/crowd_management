@@ -13,7 +13,7 @@ import torch
 from crowd_management.ingestion.frame_packet import FramePacket
 from crowd_management.models.contracts import CSRNetResult
 from crowd_management.models.csrnet.architecture import CSRNet
-from crowd_management.models.csrnet.weights import build_csrnet_model
+from crowd_management.models.csrnet.weights import build_csrnet_model, resolve_checkpoint_path
 
 
 class CSRNetInference:
@@ -25,18 +25,25 @@ class CSRNetInference:
         device: str | None = None,
         inference_resolution: tuple[int, int] | None = None,
         model_name: str = "CSRNet-VGG16",
+        strict_checkpoint: bool = True,
     ) -> None:
-        if device is None:
+        if device is None or device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
         self.inference_resolution = inference_resolution  # (width, height) or None for full
         self.model_name = model_name
+        self.resolved_checkpoint = resolve_checkpoint_path(checkpoint_path)
+        self.checkpoint_identifier = (
+            self.resolved_checkpoint.name if self.resolved_checkpoint else "CSRNet-ShanghaiTech-A"
+        )
+
         self.model: CSRNet = build_csrnet_model(
             checkpoint_path=checkpoint_path,
             device=self.device,
             load_vgg_weights=True,
+            strict_checkpoint=strict_checkpoint,
         )
 
         # ImageNet mean and std for standard VGG-16 normalization
@@ -54,13 +61,13 @@ class CSRNetInference:
         if self.inference_resolution is not None:
             proc_w, proc_h = self.inference_resolution
             # Ensure dimensions are divisible by 8 for 3 max-pooling layers
-            proc_w = (proc_w // 8) * 8
-            proc_h = (proc_h // 8) * 8
+            proc_w = max(8, (proc_w // 8) * 8)
+            proc_h = max(8, (proc_h // 8) * 8)
             frame_resized = cv2.resize(bgr_frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
         else:
             # Pad or crop to multiple of 8 if necessary
-            proc_w = (orig_w // 8) * 8
-            proc_h = (orig_h // 8) * 8
+            proc_w = max(8, (orig_w // 8) * 8)
+            proc_h = max(8, (orig_h // 8) * 8)
             if proc_w != orig_w or proc_h != orig_h:
                 frame_resized = cv2.resize(bgr_frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
             else:
@@ -122,5 +129,6 @@ class CSRNetInference:
             inference_time_ms=inference_time_ms,
             model_name=self.model_name,
             device=self.device,
+            checkpoint_identifier=self.checkpoint_identifier,
             frame=packet.frame,
         )

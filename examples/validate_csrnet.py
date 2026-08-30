@@ -1,4 +1,4 @@
-"""Standalone CSRNet Validation Utility on Real HAJJv2 Video Streams."""
+"""Standalone CSRNet Validation Utility on Real HAJJv2 Video Streams with Ground-Truth Analysis."""
 
 from __future__ import annotations
 
@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to Hajj ground-truth annotation CSV",
     )
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/csrnet_shanghaitech_part_a.pth",
+        help="Path to trained CSRNet checkpoint",
+    )
+    parser.add_argument(
         "--out-dir",
         type=str,
         default="outputs/phase_2/csrnet_validation",
@@ -46,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: int, stride: int) -> None:
+def run_validation(video_path: str, labels_path: str, checkpoint_path: str, out_dir: str, num_frames: int, stride: int) -> None:
     v_path = Path(video_path)
     l_path = Path(labels_path)
     o_dir = Path(out_dir)
@@ -56,6 +62,7 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
     print("PHASE 2 — CSRNET REAL-HAJJ VALIDATION AUDIT")
     print(f"Video Source : {v_path}")
     print(f"Labels File  : {l_path}")
+    print(f"Checkpoint   : {checkpoint_path}")
     print(f"Output Dir   : {o_dir}")
     print("=" * 75)
 
@@ -66,8 +73,10 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
         print("No ground-truth annotations found or empty dataset; running visual & sanity validation.")
 
     engine = CSRNetInference(
+        checkpoint_path=checkpoint_path,
         device="cpu",
         inference_resolution=(720, 540),
+        strict_checkpoint=True,
     )
     print(f"CSRNet initialized on device: {engine.device} (Inference Resolution: 720x540)")
 
@@ -77,7 +86,7 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
 
     results = []
     evaluated_packets = []
-    frame_idx = 0
+    gt_pairs = []  # (predicted, ground_truth)
     sampled_count = 0
 
     while sampled_count < num_frames:
@@ -104,22 +113,42 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
             res = engine.estimate(pkt)
             results.append((pkt, res))
 
-            # Render and save visuals
+            # Ground truth comparison (Hajj annotations are 1-indexed)
+            gt_count = gt.get_count_for_frame(int(s_idx) + 1) if gt else None
+            if gt_count is not None:
+                gt_pairs.append((res.crowd_count, float(gt_count)))
+
+            # Render individual and 3-panel composite visuals
             heatmap = render_density_heatmap(res.density_map, target_size=(pkt.width, pkt.height))
             overlay = render_density_overlay(pkt.frame, res.density_map, alpha=0.45)
 
-            # Draw HUD on overlay
-            gt_count = gt.get_count_for_frame(int(s_idx) + 1) if gt else None
-            gt_str = f" | GT Count: {gt_count}" if gt_count is not None else ""
+            # Create 3-panel composite: [ORIGINAL] | [DENSITY HEATMAP] | [DENSITY OVERLAY]
+            pw, ph = 480, 360
+            p1 = cv2.resize(pkt.frame, (pw, ph))
+            p2 = cv2.resize(heatmap, (pw, ph))
+            p3 = cv2.resize(overlay, (pw, ph))
 
-            hud_text = f"Cam: {res.camera_id} | Frame {res.frame_id} (Src {res.source_frame_index}) | Count: {res.crowd_count:.1f}{gt_str}"
-            cv2.putText(overlay, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(p1, "[ORIGINAL FRAME]", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            cv2.putText(p2, "[DENSITY HEATMAP]", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            gt_str = f" | GT: {gt_count}" if gt_count is not None else ""
+            cv2.putText(p3, f"[DENSITY OVERLAY] Count: {res.crowd_count:.1f}{gt_str}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0), 2)
 
-            # Save individual files
+            composite = np.hstack([p1, p2, p3])
+
+            # Header info bar
+            header = np.zeros((45, composite.shape[1], 3), dtype=np.uint8)
+            header[:] = (20, 22, 28)
+            hud_text = f"CSRNet Validation | Cam: {res.camera_id} | Frame {res.frame_id:03d} (Src {res.source_frame_index:04d}) | Time: {res.video_timestamp:.2f}s | Latency: {res.inference_time_ms:.0f}ms | Checkpoint: {res.checkpoint_identifier}"
+            cv2.putText(header, hud_text, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+            composite_full = np.vstack([header, composite])
+
+            # Save artifacts
             base_name = f"frame_{res.frame_id:04d}_src_{res.source_frame_index:04d}"
             cv2.imwrite(str(o_dir / f"{base_name}_orig.jpg"), pkt.frame)
             cv2.imwrite(str(o_dir / f"{base_name}_heatmap.jpg"), heatmap)
             cv2.imwrite(str(o_dir / f"{base_name}_overlay.jpg"), overlay)
+            cv2.imwrite(str(o_dir / f"{base_name}_composite.jpg"), composite_full)
 
             print(f"  [SAVED] {base_name}: Predicted={res.crowd_count:.1f} people (Inference: {res.inference_time_ms:.1f} ms){gt_str}")
 
@@ -153,6 +182,24 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
     dynamic_response = len(set(np.round(counts, 2))) > 1
     print(f"5. Dynamic Response (Predictions respond across different video scenes): {'PASS' if dynamic_response else 'FAIL'} (Range: {min(counts):.1f} - {max(counts):.1f})")
 
+    # 6. Ground-Truth Analysis
+    print("\n" + "=" * 75)
+    print("GROUND-TRUTH ACCURACY ANALYSIS:")
+    print("=" * 75)
+    if gt_pairs:
+        preds = np.array([p for p, _ in gt_pairs])
+        gts = np.array([g for _, g in gt_pairs])
+        mae = float(np.mean(np.abs(preds - gts)))
+        rmse = float(np.sqrt(np.mean((preds - gts) ** 2)))
+        rel_err = float(np.mean(np.abs(preds - gts) / (gts + 1e-6)) * 100.0)
+        print(f"Matched Ground-Truth Frames : {len(gt_pairs)}")
+        print(f"Mean Absolute Error (MAE)   : {mae:.2f}")
+        print(f"Root Mean Square Error (RMSE): {rmse:.2f}")
+        print(f"Mean Relative Error         : {rel_err:.1f}%")
+        print(f"Mean Predicted Count        : {np.mean(preds):.2f} vs Ground Truth: {np.mean(gts):.2f}")
+    else:
+        print("Ground truth could not be reliably aligned to individual frames (no matching CSV frame indices).")
+
     # Summary
     print("\n" + "=" * 75)
     print("CSRNET VALIDATION SUMMARY:")
@@ -167,4 +214,4 @@ def run_validation(video_path: str, labels_path: str, out_dir: str, num_frames: 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_validation(args.video, args.labels, args.out_dir, args.num_frames, args.stride)
+    run_validation(args.video, args.labels, args.checkpoint, args.out_dir, args.num_frames, args.stride)

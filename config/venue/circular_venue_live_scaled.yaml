@@ -1,0 +1,34 @@
+# Circular Demo Venue Configuration - Live Scaling Profile
+#
+# Controlled demonstration profile with scaled gate capacities matching
+# CSRNet's uncalibrated observation range (2-6 people) to demonstrate
+# real-time live DIVERT decisions on streaming Hajj videos.
+#
+# Active gates match enabled cameras:
+# cam_01 -> G1 (Capacity: 3)
+# cam_02 -> G2 (Capacity: 50)
+#
+# NOTE: Capacity 3 is for demonstration scaling only, not real-world gate capacity.
+
+venue:
+  id: demo_venue_live
+  name: Circular Demo Venue (Live Scaled)
+
+  geometry:
+    type: circular
+    radius_m: 100
+
+  auto_circular_connections: true
+
+  gates:
+    - gate_id: G1
+      name: Gate North (Constrained)
+      capacity: 3
+      position_index: 0
+      camera_id: cam_01
+
+    - gate_id: G2
+      name: Gate East (High Capacity Target)
+      capacity: 50
+      position_index: 1
+      camera_id: cam_02

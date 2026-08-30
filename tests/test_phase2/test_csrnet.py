@@ -1,8 +1,9 @@
-"""Unit tests for CSRNet model and inference engine."""
+"""Unit tests for CSRNet model, fail-fast verification, and inference engine."""
 
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import torch
 from crowd_management.ingestion.frame_packet import FramePacket
 from crowd_management.models.csrnet.architecture import CSRNet
 from crowd_management.models.csrnet.infer import CSRNetInference
+from crowd_management.models.csrnet.weights import CSRNetCheckpointError, build_csrnet_model
 
 
 def test_csrnet_architecture_shape():
@@ -28,8 +30,21 @@ def test_csrnet_architecture_shape():
     assert torch.all(out >= 0.0)
 
 
+def test_csrnet_fail_fast_missing_checkpoint():
+    """Verify that specifying a non-existent checkpoint raises CSRNetCheckpointError."""
+    with pytest.raises(CSRNetCheckpointError, match="missing or invalid"):
+        build_csrnet_model(
+            checkpoint_path="non_existent_weights_12345.pth",
+            strict_checkpoint=True,
+        )
+
+
 def test_csrnet_infer_deterministic():
-    engine = CSRNetInference(device="cpu", inference_resolution=(128, 128))
+    engine = CSRNetInference(
+        checkpoint_path="checkpoints/csrnet_shanghaitech_part_a.pth",
+        device="cpu",
+        inference_resolution=(128, 128),
+    )
 
     frame = np.ones((128, 128, 3), dtype=np.uint8) * 128
     packet = FramePacket(
@@ -53,3 +68,4 @@ def test_csrnet_infer_deterministic():
     assert res1.density_map.shape == (16, 16)
     assert np.isfinite(res1.crowd_count)
     assert res1.crowd_count >= 0.0
+    assert "csrnet_shanghaitech_part_a" in res1.checkpoint_identifier.lower()

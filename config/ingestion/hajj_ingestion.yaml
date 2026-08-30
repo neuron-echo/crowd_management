@@ -8,15 +8,28 @@ ingestion:
   buffer_size: 30
   drop_policy: oldest
 
+models:
+  device: auto
+  csrnet:
+    enabled: true
+    checkpoint_path: checkpoints/csrnet_shanghaitech_part_a.pth
+    inference_resolution: [720, 540]
+  raft:
+    enabled: true
+    model_size: large
+    inference_resolution: [512, 384]
+
 cameras:
   - camera_id: cam_01
     name: Hajj Video 01
     source_type: video
-    source: HAJJv2.Dataset/Testing/Videos/2.mp4
+    source: HAJJv2.Dataset/Training/Videos/2.mp4
     enabled: true
 
   - camera_id: cam_02
     name: Hajj Video 02
     source_type: video
-    source: HAJJv2.Dataset/Testing/Videos/3.mp4
+    source: HAJJv2.Dataset/Training/Videos/3.mp4
     enabled: true
+
+ 
