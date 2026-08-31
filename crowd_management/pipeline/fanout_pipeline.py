@@ -12,11 +12,11 @@ from typing import Any, Callable
 from crowd_management.config.loader import load_ingestion_config
 from crowd_management.config.schemas import AppConfig
 from crowd_management.ingestion.multi_camera import MultiCameraProducer
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 from crowd_management.models.manager import ModelManager
+from crowd_management.pipeline.bytetrack_worker import ByteTrackWorker
 from crowd_management.pipeline.csrnet_worker import CSRNetWorker
 from crowd_management.pipeline.distributor import FrameDistributor
-from crowd_management.pipeline.raft_worker import RAFTWorker
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 class FanOutPipeline:
     """Coordinates MultiCameraProducer ingestion, fan-out distribution,
 
-    and parallel CSRNet + RAFT model inference workers.
+    and parallel CSRNet + ByteTrack model inference workers.
     """
 
     def __init__(
@@ -32,9 +32,8 @@ class FanOutPipeline:
         config: AppConfig | str | Path,
         model_manager: ModelManager | None = None,
         csrnet_callback: Callable[[CSRNetResult], None] | None = None,
-        raft_callback: Callable[[RAFTResult], None] | None = None,
+        bytetrack_callback: Callable[[ByteTrackResult], None] | None = None,
         csrnet_resolution: tuple[int, int] | None = (720, 540),
-        raft_resolution: tuple[int, int] | None = (512, 384),
         queue_capacity: int = 15,
     ) -> None:
         if isinstance(config, (str, Path)):
@@ -48,13 +47,12 @@ class FanOutPipeline:
         self.model_manager = model_manager or ModelManager(
             models_config=self.config.models,
             csrnet_resolution=csrnet_resolution,
-            raft_resolution=raft_resolution,
         )
 
         # Fan-out distributor
         self.distributor = FrameDistributor(
             csrnet_buffer_size=queue_capacity,
-            raft_buffer_size=queue_capacity,
+            bytetrack_buffer_size=queue_capacity,
             drop_policy=self.config.ingestion.drop_policy,
         )
 
@@ -64,10 +62,10 @@ class FanOutPipeline:
             engine=self.model_manager.csrnet,
             result_callback=csrnet_callback,
         )
-        self.raft_worker = RAFTWorker(
-            input_queue=self.distributor.raft_queue,
-            engine=self.model_manager.raft,
-            result_callback=raft_callback,
+        self.bytetrack_worker = ByteTrackWorker(
+            input_queue=self.distributor.bytetrack_queue,
+            engine=self.model_manager.bytetrack,
+            result_callback=bytetrack_callback,
         )
 
         self._router_thread: threading.Thread | None = None
@@ -88,7 +86,7 @@ class FanOutPipeline:
 
         # Start downstream workers first
         self.csrnet_worker.start()
-        self.raft_worker.start()
+        self.bytetrack_worker.start()
 
         # Start distributor routing thread
         self._router_thread = threading.Thread(target=self._route_frames, name="FanOutRouter", daemon=True)
@@ -110,7 +108,7 @@ class FanOutPipeline:
             self._router_thread.join(timeout=2.0)
 
         self.csrnet_worker.stop()
-        self.raft_worker.stop()
+        self.bytetrack_worker.stop()
         self.distributor.close()
         self.producer.shutdown()
         self._is_running = False
@@ -161,10 +159,10 @@ class FanOutPipeline:
                 "avg_latency_ms": self.csrnet_worker.avg_inference_time_ms,
                 "queue_size": len(self.distributor.csrnet_queue),
             },
-            "raft": {
-                "pairs_processed": self.raft_worker.pairs_processed,
-                "avg_latency_ms": self.raft_worker.avg_inference_time_ms,
-                "queue_size": len(self.distributor.raft_queue),
+            "bytetrack": {
+                "frames_processed": self.bytetrack_worker.frames_processed,
+                "avg_latency_ms": self.bytetrack_worker.avg_inference_time_ms,
+                "queue_size": len(self.distributor.bytetrack_queue),
             },
         }
 

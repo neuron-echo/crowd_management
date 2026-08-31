@@ -1,6 +1,6 @@
 dataset:
   name: HAJJv2
-  root: HAJJv2.Dataset
+  root: video samples
 
 ingestion:
   target_fps: 5
@@ -12,24 +12,24 @@ models:
   device: auto
   csrnet:
     enabled: true
-    checkpoint_path: checkpoints/csrnet_shanghaitech_part_a.pth
+    checkpoint_path: checkpoints/PartAmodel_best.pth
     inference_resolution: [720, 540]
-  raft:
+  bytetrack:
     enabled: true
-    model_size: large
-    inference_resolution: [512, 384]
+    model_path: yolov8l.pt
+    tracker_config: bytetrack.yaml
+    confidence_threshold: 0.3
+    motion_threshold_px: 2.0
 
 cameras:
   - camera_id: cam_01
-    name: Hajj Video 01
+    name: Video Sample 2
     source_type: video
-    source: HAJJv2.Dataset/Training/Videos/2.mp4
+    source: video samples/2.mp4
     enabled: true
 
   - camera_id: cam_02
-    name: Hajj Video 02
+    name: Video Sample 5
     source_type: video
-    source: HAJJv2.Dataset/Training/Videos/3.mp4
+    source: video samples/5.mp4
     enabled: true
-
- 

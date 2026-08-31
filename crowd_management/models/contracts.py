@@ -65,77 +65,73 @@ class CSRNetResult:
 
 
 @dataclass(frozen=True)
-class RAFTResult:
-    """Canonical result packet from RAFT optical flow motion estimation with robust analytics."""
+class ByteTrackResult:
+    """Canonical result packet from YOLOv8 + ByteTrack crowd motion estimation.
+
+    Replaces RAFTResult. Provides the same crowd-level motion fields consumed
+    by Phase2Adapter and the Decision Engine, derived from per-person track
+    displacement rather than dense optical flow.
+
+    Fields:
+        camera_id:              Source camera identifier.
+        frame_id:               Monotonic frame counter from FrameProducer.
+        source_frame_index:     Original frame index in the source video.
+        video_timestamp:        Position in the source video (seconds).
+        wall_clock_timestamp:   Wall-clock time when the frame was captured.
+        track_count:            Number of active tracked persons in this frame.
+        median_velocity:        50th-pct velocity (px/sec) across tracked persons.
+        average_velocity:       Mean velocity (px/sec) across tracked persons.
+        dominant_direction_deg: Crowd movement direction 0–360° (vector sum).
+        flow_consistency:       ||Σv|| / Σ||v|| ∈ [0, 1] — 1 = perfectly uniform.
+        active_motion_ratio:    Fraction of tracks with velocity > threshold ∈ [0, 1].
+        motion_confidence:      Composite confidence score ∈ [0, 1].
+        inference_time_ms:      YOLOv8 + ByteTrack inference wall-clock time.
+        model_name:             YOLO model weights identifier (e.g. "yolov8l.pt").
+        device:                 Inference device ("cpu" or "cuda").
+        result_timestamp:       Wall-clock time of result creation.
+    """
 
     camera_id: str
-    previous_frame_id: int
-    current_frame_id: int
-    previous_source_frame_index: int
-    current_source_frame_index: int
-    previous_timestamp: float
-    current_timestamp: float
-    flow_width: int
-    flow_height: int
-    average_velocity: float  # Mean velocity magnitude (px/frame at inference resolution)
-    median_velocity: float   # 50th percentile (robust against outlier vectors)
-    max_velocity: float
-    velocity_variance: float
-    dominant_direction_deg: float  # 0° to 360° (vector sum)
-    flow_consistency: float        # ||Σv|| / Σ||v|| in [0, 1]
-    active_motion_ratio: float     # Fraction of pixels with motion > threshold
-    motion_confidence: float       # Composite confidence score in [0, 1]
+    frame_id: int
+    source_frame_index: int
+    video_timestamp: float
+    wall_clock_timestamp: float
+    track_count: int
+    median_velocity: float
+    average_velocity: float
+    dominant_direction_deg: float
+    flow_consistency: float
+    active_motion_ratio: float
+    motion_confidence: float
     inference_time_ms: float
     model_name: str
     device: str
-    delta_time: float = 0.0        # Actual video time delta: current_timestamp - previous_timestamp
-    mean_velocity: float = 0.0     # Explicit synonym for average_velocity
-    p90_velocity: float = 0.0      # 90th percentile velocity
-    p95_velocity: float = 0.0      # 95th percentile velocity
-    result_timestamp: float = 0.0  # Wall-clock creation timestamp
-    is_stale: bool = False         # True if result age exceeds freshness threshold
-    flow_summary: np.ndarray | None = None
+    result_timestamp: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.previous_frame_id >= self.current_frame_id:
-            raise ValueError(
-                f"previous_frame_id ({self.previous_frame_id}) must be < current_frame_id ({self.current_frame_id})"
-            )
         if not (0.0 <= self.dominant_direction_deg <= 360.0):
             raise ValueError(f"dominant_direction_deg must be in [0, 360], got {self.dominant_direction_deg}")
         if not (0.0 <= self.flow_consistency <= 1.0):
             raise ValueError(f"flow_consistency must be in [0, 1], got {self.flow_consistency}")
         if not (0.0 <= self.active_motion_ratio <= 1.0):
             raise ValueError(f"active_motion_ratio must be in [0, 1], got {self.active_motion_ratio}")
+        if not (0.0 <= self.motion_confidence <= 1.0):
+            raise ValueError(f"motion_confidence must be in [0, 1], got {self.motion_confidence}")
 
-        avg_vel = float(self.average_velocity)
-        object.__setattr__(self, "average_velocity", avg_vel)
-        object.__setattr__(self, "mean_velocity", float(self.mean_velocity) if self.mean_velocity > 0 else avg_vel)
+        object.__setattr__(self, "camera_id", str(self.camera_id))
+        object.__setattr__(self, "frame_id", int(self.frame_id))
+        object.__setattr__(self, "source_frame_index", int(self.source_frame_index))
+        object.__setattr__(self, "video_timestamp", float(self.video_timestamp))
+        object.__setattr__(self, "wall_clock_timestamp", float(self.wall_clock_timestamp))
+        object.__setattr__(self, "track_count", int(self.track_count))
         object.__setattr__(self, "median_velocity", float(self.median_velocity))
-        object.__setattr__(self, "p90_velocity", float(self.p90_velocity) if self.p90_velocity > 0 else float(self.median_velocity))
-        object.__setattr__(self, "p95_velocity", float(self.p95_velocity) if self.p95_velocity > 0 else float(self.max_velocity))
-        object.__setattr__(self, "max_velocity", float(self.max_velocity))
-        object.__setattr__(self, "velocity_variance", float(self.velocity_variance))
+        object.__setattr__(self, "average_velocity", float(self.average_velocity))
         object.__setattr__(self, "dominant_direction_deg", float(self.dominant_direction_deg))
         object.__setattr__(self, "flow_consistency", float(self.flow_consistency))
         object.__setattr__(self, "active_motion_ratio", float(self.active_motion_ratio))
         object.__setattr__(self, "motion_confidence", float(self.motion_confidence))
         object.__setattr__(self, "inference_time_ms", float(self.inference_time_ms))
-        object.__setattr__(self, "previous_timestamp", float(self.previous_timestamp))
-        object.__setattr__(self, "current_timestamp", float(self.current_timestamp))
-        dt = float(self.delta_time) if self.delta_time > 0 else max(1e-5, float(self.current_timestamp - self.previous_timestamp))
-        object.__setattr__(self, "delta_time", dt)
-        object.__setattr__(self, "previous_frame_id", int(self.previous_frame_id))
-        object.__setattr__(self, "current_frame_id", int(self.current_frame_id))
-        object.__setattr__(self, "previous_source_frame_index", int(self.previous_source_frame_index))
-        object.__setattr__(self, "current_source_frame_index", int(self.current_source_frame_index))
-        object.__setattr__(self, "flow_width", int(self.flow_width))
-        object.__setattr__(self, "flow_height", int(self.flow_height))
         if self.result_timestamp <= 0.0:
             object.__setattr__(self, "result_timestamp", time.time())
         else:
             object.__setattr__(self, "result_timestamp", float(self.result_timestamp))
-        object.__setattr__(self, "is_stale", bool(self.is_stale))
-
-        if self.flow_summary is not None:
-            object.__setattr__(self, "flow_summary", np.asarray(self.flow_summary, dtype=np.float32).copy())

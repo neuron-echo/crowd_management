@@ -1,14 +1,16 @@
-"""Temporal synchronization between CSRNet and RAFT streams.
+"""Temporal synchronization between CSRNet and ByteTrack streams.
 
-Enforces strict temporal causality:
-1. SAME CAMERA: CSRNet and RAFT observations must originate from the same camera.
-2. CONSECUTIVE SOURCE FRAMES: RAFT pairs must be consecutive sampled frames (prev + 1 == curr).
-3. NO FUTURE PAIRS: RAFT pair endpoint must be <= current CSRNet frame (and timestamp <= CSRNet timestamp).
-4. HISTORICAL REUSE: If no new RAFT pair has arrived for the current CSRNet frame, reuse the MOST RECENT
-   valid historical pair, marked as LAST_KNOWN.
-5. DYNAMIC STALENESS: Age is calculated as (csr_video_timestamp - raft_video_timestamp). If age > threshold,
-   motion is marked STALE and excluded from CrowdState velocity/direction.
-6. UNAVAILABLE: If no valid historical pair exists <= current CSRNet frame, motion is UNAVAILABLE.
+ByteTrack operates on individual frames (not pairs), so synchronization is
+simpler than the former RAFT-based approach:
+
+Rules:
+1. SAME CAMERA: CSRNet and ByteTrack observations must share camera_id.
+2. NO FUTURE FRAMES: ByteTrack frame_id must be <= current CSRNet frame_id.
+3. HISTORICAL REUSE: If no ByteTrack result exists for the exact CSRNet frame,
+   reuse the most recent valid historical result, marked as LAST_KNOWN.
+4. STALENESS: Age is computed as (csr_frame_id - bytetrack_frame_id). If the
+   frame gap exceeds the staleness threshold, motion is marked STALE.
+5. UNAVAILABLE: If no valid historical result exists, motion is UNAVAILABLE.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 
 
 class MotionFreshness(str, Enum):
@@ -32,261 +34,224 @@ class MotionFreshness(str, Enum):
 @dataclass(frozen=True)
 class SyncResult:
     """Detailed temporal synchronization result for a CSRNet frame."""
-    raft_result: RAFTResult | None
+    bytetrack_result: ByteTrackResult | None
     status: MotionFreshness
-    age_s: float
+    age_frames: int           # frame_id delta between CSRNet and ByteTrack
     is_valid_motion: bool
-    pair_provenance: str | None
+    pair_provenance: str | None  # e.g. "bytetrack@frame_42"
     reason: str
-    rejected_future_count: int = 0
 
     @property
     def display_tag(self) -> str:
         if self.status == MotionFreshness.NEW:
             return "[NEW]"
         elif self.status == MotionFreshness.LAST_KNOWN:
-            return f"[LAST KNOWN (age: {self.age_s:.2f}s)]"
+            return f"[LAST KNOWN (gap: {self.age_frames} frames)]"
         elif self.status == MotionFreshness.STALE:
-            return f"[STALE ({self.age_s:.2f}s > threshold) - EXCLUDED]"
+            return f"[STALE (gap {self.age_frames} frames > threshold) - EXCLUDED]"
         else:
             return "[UNAVAILABLE]"
 
 
 class TemporalSynchronizer:
-    """Thread-safe per-camera temporal synchronizer for Phase 2 model results.
+    """Thread-safe per-camera temporal synchronizer for ByteTrack + CSRNet results.
 
-    Maintains a bounded history of completed RAFT pairs and matches each incoming
-    CSRNet frame with its latest valid historical or concurrent RAFT pair.
+    Maintains a bounded FIFO history of ByteTrack results per camera and, for
+    each incoming CSRNet frame, finds the most recent ByteTrack result whose
+    frame_id does not exceed the CSRNet frame_id.
     """
 
-    def __init__(self, max_history_per_camera: int = 50) -> None:
+    def __init__(
+        self,
+        max_history_per_camera: int = 50,
+        stale_frame_gap: int = 10,
+    ) -> None:
+        """
+        Args:
+            max_history_per_camera: Maximum ByteTrackResult history per camera.
+            stale_frame_gap: Frame-id delta above which motion is considered STALE.
+        """
         self._max_history = max_history_per_camera
-        self._history: dict[str, deque[RAFTResult]] = {}
-        self._last_used_pair_id: dict[str, int] = {}
-        self._future_rejections_count: int = 0
-        self._total_sync_queries: int = 0
-        self._unavailable_count: int = 0
-        self._last_known_count: int = 0
-        self._new_count: int = 0
-        self._stale_count: int = 0
+        self._stale_frame_gap = stale_frame_gap
+        self._history: dict[str, deque[ByteTrackResult]] = {}
+        self._last_used_frame_id: dict[str, int] = {}
 
-    def add_raft_result(self, raft_res: RAFTResult) -> None:
-        """Add a newly completed RAFT result to the camera's history buffer."""
-        cam_id = raft_res.camera_id
+        # Telemetry counters
+        self._total_sync_queries: int = 0
+        self._new_count: int = 0
+        self._last_known_count: int = 0
+        self._stale_count: int = 0
+        self._unavailable_count: int = 0
+
+    def add_bytetrack_result(self, bt_res: ByteTrackResult) -> None:
+        """Add a newly completed ByteTrack result to the camera's history buffer."""
+        cam_id = bt_res.camera_id
         if cam_id not in self._history:
             self._history[cam_id] = deque(maxlen=self._max_history)
-
-        # Basic consecutive check on insertion
-        self._history[cam_id].append(raft_res)
+        self._history[cam_id].append(bt_res)
 
     def synchronize(
         self,
         csrnet_res: CSRNetResult,
-        stale_threshold_s: float = 1.0,
+        stale_frame_gap: int | None = None,
     ) -> SyncResult:
-        """Find the latest valid historical or concurrent RAFT pair for the given CSRNet frame.
+        """Find the latest valid ByteTrack result for the given CSRNet frame.
 
-        Rules:
-        1. Must match camera_id
-        2. Must be consecutive: pair_prev + 1 == pair_curr
-        3. pair_curr <= csrnet_res.frame_id
-        4. raft_video_timestamp <= csrnet_res.video_timestamp + 1e-4
-        5. Future pairs (curr > csr_frame or raft_ts > csr_ts) are strictly rejected.
-        6. Choose the candidate with highest current_frame_id (most recent valid).
+        Args:
+            csrnet_res: CSRNet density estimation result to match against.
+            stale_frame_gap: Override stale threshold (frames). Uses constructor
+                             default if None.
+
+        Returns:
+            SyncResult describing the matched ByteTrack result and its freshness.
         """
         self._total_sync_queries += 1
+        threshold = stale_frame_gap if stale_frame_gap is not None else self._stale_frame_gap
         cam_id = csrnet_res.camera_id
         csr_frame = csrnet_res.frame_id
-        csr_time = csrnet_res.video_timestamp
 
         camera_history = self._history.get(cam_id, deque())
         if not camera_history:
             self._unavailable_count += 1
             return SyncResult(
-                raft_result=None,
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
                 pair_provenance=None,
-                reason="NO_RAFT_RESULTS_FOR_CAMERA",
-                rejected_future_count=0,
+                reason="NO_BYTETRACK_RESULTS_FOR_CAMERA",
             )
 
-        valid_candidates: list[RAFTResult] = []
-        future_count = 0
-
-        for r in camera_history:
-            # 1. Camera check
-            if r.camera_id != cam_id:
-                continue
-
-            # 2. Consecutive check
-            is_consecutive = (r.previous_frame_id + 1 == r.current_frame_id)
-            if not is_consecutive:
-                continue
-
-            # 3. Future check (frame index or video timestamp ahead of CSRNet)
-            is_future_frame = (r.current_frame_id > csr_frame)
-            is_future_time = (r.current_timestamp > csr_time + 1e-4)
-
-            if is_future_frame or is_future_time:
-                future_count += 1
-                continue
-
-            # 4. Valid historical/concurrent candidate
-            valid_candidates.append(r)
-
-        if future_count > 0:
-            self._future_rejections_count += future_count
+        # Find the most recent ByteTrack result with frame_id <= csr_frame
+        valid_candidates = [r for r in camera_history
+                            if r.camera_id == cam_id and r.frame_id <= csr_frame]
 
         if not valid_candidates:
             self._unavailable_count += 1
-            reason = "FUTURE_PAIR_REJECTED" if future_count > 0 else "NO_VALID_HISTORICAL_PAIR"
             return SyncResult(
-                raft_result=None,
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
                 pair_provenance=None,
-                reason=reason,
-                rejected_future_count=future_count,
+                reason="NO_VALID_HISTORICAL_BYTETRACK",
             )
 
-        # Pick the MOST RECENT valid candidate (highest current_frame_id)
-        best_raft = max(valid_candidates, key=lambda x: (x.current_frame_id, x.current_timestamp))
-        pair_prov = f"{best_raft.previous_frame_id}->{best_raft.current_frame_id}"
+        # Pick the most recent (highest frame_id)
+        best = max(valid_candidates, key=lambda r: r.frame_id)
+        age_frames = csr_frame - best.frame_id
+        prov = f"bytetrack@frame_{best.frame_id}"
 
-        # Calculate video timestamp age
-        age_s = max(0.0, csr_time - best_raft.current_timestamp)
-
-        if age_s > stale_threshold_s:
+        # Staleness check (frame gap)
+        if age_frames > threshold:
             self._stale_count += 1
             return SyncResult(
-                raft_result=best_raft,
+                bytetrack_result=best,
                 status=MotionFreshness.STALE,
-                age_s=age_s,
+                age_frames=age_frames,
                 is_valid_motion=False,
-                pair_provenance=pair_prov,
-                reason=f"EXCEEDS_STALE_THRESHOLD ({age_s:.2f}s > {stale_threshold_s:.1f}s)",
-                rejected_future_count=future_count,
+                pair_provenance=prov,
+                reason=f"EXCEEDS_STALE_THRESHOLD (gap {age_frames} > {threshold})",
             )
 
-        # Motion is temporally valid and fresh
-        last_used = self._last_used_pair_id.get(cam_id)
-        if last_used == best_raft.current_frame_id:
+        # Determine NEW vs LAST_KNOWN
+        last_used = self._last_used_frame_id.get(cam_id, -1)
+        if best.frame_id != last_used:
+            status = MotionFreshness.NEW
+            reason = "FRESH_OBSERVATION"
+            self._last_used_frame_id[cam_id] = best.frame_id
+            self._new_count += 1
+        else:
             status = MotionFreshness.LAST_KNOWN
             reason = "LAST_KNOWN_HISTORICAL"
             self._last_known_count += 1
-        else:
-            status = MotionFreshness.NEW
-            reason = "FRESH_OBSERVATION"
-            self._last_used_pair_id[cam_id] = best_raft.current_frame_id
-            self._new_count += 1
 
         return SyncResult(
-            raft_result=best_raft,
+            bytetrack_result=best,
             status=status,
-            age_s=age_s,
+            age_frames=age_frames,
             is_valid_motion=True,
-            pair_provenance=pair_prov,
+            pair_provenance=prov,
             reason=reason,
-            rejected_future_count=future_count,
         )
 
     @staticmethod
     def validate_single_pair(
         csrnet_result: CSRNetResult | None,
-        raft_result: RAFTResult | None,
-        stale_threshold_s: float = 1.0,
+        bytetrack_result: ByteTrackResult | None,
+        stale_frame_gap: int = 10,
     ) -> SyncResult:
-        """Helper to validate a single given pair without history buffer."""
-        if csrnet_result is None and raft_result is None:
+        """Validate a single given pair without a history buffer (for testing/demo)."""
+        if csrnet_result is None and bytetrack_result is None:
             return SyncResult(
-                raft_result=None,
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
                 pair_provenance=None,
                 reason="MISSING_OBSERVATION",
             )
 
-        if csrnet_result is None and raft_result is not None:
-            # RAFT observation is provided alone (e.g. testing or motion-only camera)
-            pair_prov = f"{raft_result.previous_frame_id}->{raft_result.current_frame_id}"
+        if bytetrack_result is None:
             return SyncResult(
-                raft_result=raft_result,
-                status=MotionFreshness.NEW,
-                age_s=0.0,
-                is_valid_motion=True,
-                pair_provenance=pair_prov,
-                reason="MOTION_WITHOUT_DENSITY",
-            )
-
-        if raft_result is None:
-            return SyncResult(
-                raft_result=None,
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
                 pair_provenance=None,
                 reason="MISSING_MOTION_OBSERVATION",
             )
 
-        if csrnet_result.camera_id != raft_result.camera_id:
+        if csrnet_result is None:
+            prov = f"bytetrack@frame_{bytetrack_result.frame_id}"
             return SyncResult(
-                raft_result=None,
+                bytetrack_result=bytetrack_result,
+                status=MotionFreshness.NEW,
+                age_frames=0,
+                is_valid_motion=True,
+                pair_provenance=prov,
+                reason="MOTION_WITHOUT_DENSITY",
+            )
+
+        if csrnet_result.camera_id != bytetrack_result.camera_id:
+            return SyncResult(
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
                 pair_provenance=None,
                 reason="CROSS_CAMERA_MISMATCH",
             )
 
-        # Check consecutive
-        if raft_result.previous_frame_id + 1 != raft_result.current_frame_id:
+        if bytetrack_result.frame_id > csrnet_result.frame_id:
             return SyncResult(
-                raft_result=None,
+                bytetrack_result=None,
                 status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
+                age_frames=0,
                 is_valid_motion=False,
-                pair_provenance=f"{raft_result.previous_frame_id}->{raft_result.current_frame_id}",
-                reason="NON_CONSECUTIVE_PAIR",
+                pair_provenance=f"bytetrack@frame_{bytetrack_result.frame_id}",
+                reason="FUTURE_BYTETRACK_REJECTED",
             )
 
-        # Check future pair
-        is_future_frame = raft_result.current_frame_id > csrnet_result.frame_id
-        is_future_time = raft_result.current_timestamp > csrnet_result.video_timestamp + 1e-4
+        age_frames = csrnet_result.frame_id - bytetrack_result.frame_id
+        prov = f"bytetrack@frame_{bytetrack_result.frame_id}"
 
-        if is_future_frame or is_future_time:
+        if age_frames > stale_frame_gap:
             return SyncResult(
-                raft_result=None,
-                status=MotionFreshness.UNAVAILABLE,
-                age_s=0.0,
-                is_valid_motion=False,
-                pair_provenance=f"{raft_result.previous_frame_id}->{raft_result.current_frame_id}",
-                reason="FUTURE_PAIR_REJECTED",
-                rejected_future_count=1,
-            )
-
-        pair_prov = f"{raft_result.previous_frame_id}->{raft_result.current_frame_id}"
-        age_s = max(0.0, csrnet_result.video_timestamp - raft_result.current_timestamp)
-
-        if age_s > stale_threshold_s:
-            return SyncResult(
-                raft_result=raft_result,
+                bytetrack_result=bytetrack_result,
                 status=MotionFreshness.STALE,
-                age_s=age_s,
+                age_frames=age_frames,
                 is_valid_motion=False,
-                pair_provenance=pair_prov,
-                reason=f"EXCEEDS_STALE_THRESHOLD ({age_s:.2f}s > {stale_threshold_s:.1f}s)",
+                pair_provenance=prov,
+                reason=f"EXCEEDS_STALE_THRESHOLD (gap {age_frames} > {stale_frame_gap})",
             )
 
         return SyncResult(
-            raft_result=raft_result,
+            bytetrack_result=bytetrack_result,
             status=MotionFreshness.NEW,
-            age_s=age_s,
+            age_frames=age_frames,
             is_valid_motion=True,
-            pair_provenance=pair_prov,
+            pair_provenance=prov,
             reason="FRESH_OBSERVATION",
         )
 
@@ -298,5 +263,4 @@ class TemporalSynchronizer:
             "last_known_count": self._last_known_count,
             "stale_count": self._stale_count,
             "unavailable_count": self._unavailable_count,
-            "future_rejections_count": self._future_rejections_count,
         }

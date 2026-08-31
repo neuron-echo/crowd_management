@@ -1,8 +1,8 @@
 """Live Multi-Camera Phase 3 Integration Runner: End-to-End Real Vision -> CrowdState -> Decision Engine.
 
 NO SYNTHETIC CROWDSTATE DATA IS USED.
-Every decision originates from the real CSRNet crowd count and RAFT optical flow
-computed on streaming HAJJv2 video frames.
+Every decision originates from the real CSRNet crowd count and YOLOv8+ByteTrack
+crowd motion computed on streaming HAJJv2 video frames.
 
 Data Flow:
     Real Video Stream (Phase 1)
@@ -11,16 +11,16 @@ Data Flow:
     FramePacket -> FrameDistributor
         |                    |
         v                    v
-    CSRNetWorker        RAFTWorker (Asynchronous)
-    (CSRNetResult)      (RAFTResult)
+    CSRNetWorker        ByteTrackWorker (Asynchronous)
+    (CSRNetResult)      (ByteTrackResult)
         |                    |
         +---------+----------+
                   |
                   v
-          TemporalSynchronizer (causality check: pair_curr <= csr_frame)
+          TemporalSynchronizer (causality check: bytetrack.frame_id <= csr.frame_id)
                   |
                   v
-            Phase2Adapter (fuse with video-timestamp freshness)
+            Phase2Adapter (fuse with staleness check)
                   |
                   v
               CrowdState (model-agnostic, stale/future motion excluded)
@@ -44,7 +44,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -73,7 +72,7 @@ from crowd_management.decision.contracts import (
 )
 from crowd_management.decision.engine import DecisionEngine
 from crowd_management.decision.trend import TrendTracker
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 from crowd_management.models.manager import ModelManager
 from crowd_management.pipeline.fanout_pipeline import FanOutPipeline
 from crowd_management.utils.visualization import (
@@ -114,8 +113,8 @@ def parse_args() -> argparse.Namespace:
         help="Disable interactive cv2.imshow window (headless mode, saves snapshots to disk)",
     )
     parser.add_argument(
-        "--stale-threshold", type=float, default=1.0,
-        help="Maximum acceptable result age in video seconds before marking motion STALE and excluding from state",
+        "--stale-frames", type=int, default=10,
+        help="Maximum frame-id gap before ByteTrack motion is marked STALE and excluded",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -125,25 +124,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_camera_gate_mapping(config: Any, venue: VenueTopology) -> list[str]:
-    """Validate 1-to-1 mapping between active enabled cameras and observed venue gates.
-
-    Returns:
-        List of active camera IDs.
-
-    Raises:
-        ValueError: If active camera has no gate, or venue gate has no camera.
-    """
+    """Validate 1-to-1 mapping between active enabled cameras and observed venue gates."""
     active_cameras = [c.camera_id for c in config.cameras if c.enabled]
     if not active_cameras:
         raise ValueError("No enabled cameras found in ingestion configuration.")
 
-    # Check each active camera maps to a valid venue gate
     for cam_id in active_cameras:
         gate_id = venue.gate_for_camera(cam_id)
         if gate_id is None:
             raise ValueError(f"Active camera '{cam_id}' has no corresponding gate in venue '{venue.venue_id}'")
 
-    # Check each gate in venue maps to an active camera
     for gid in venue.gate_ids:
         cam_id = venue.camera_for_gate(gid)
         if cam_id is None or cam_id not in active_cameras:
@@ -165,8 +155,8 @@ def print_startup_banner(
     print("PHASE 3 -- REAL-TIME END-TO-END CROWD MANAGEMENT LIVE INTEGRATION RUNNER")
     print("=" * 90)
     print("LIVE MODE:")
-    print("  REAL VIDEO + REAL CSRNET + REAL RAFT + TEMPORAL SYNCHRONIZER + DECISION ENGINE")
-    print("  NO SYNTHETIC CROWDSTATE | STRICT TEMPORAL CAUSALITY (pair <= current frame)")
+    print("  REAL VIDEO + REAL CSRNET + YOLOV8+BYTETRACK + TEMPORAL SYNCHRONIZER + DECISION ENGINE")
+    print("  NO SYNTHETIC CROWDSTATE | STRICT TEMPORAL CAUSALITY (bytetrack.frame_id <= csr.frame_id)")
     print()
     print(f"Dataset         : {config.dataset.name} ({config.dataset.root})")
     print(f"Venue           : {venue.venue_name} ({venue.venue_id})")
@@ -185,14 +175,15 @@ def print_startup_banner(
         cap = venue.get_gate_capacity(gid)
         print(f"  {gid} (Camera: {cam}, Capacity: {cap})")
     print()
-    print(f"Stale Threshold : {args.stale_threshold:.2f}s (Video Time)")
+    bt_cfg = config.models.bytetrack
+    print(f"ByteTrack Model : {bt_cfg.model_path} (conf={bt_cfg.confidence_threshold})")
+    print(f"Stale Threshold : {args.stale_frames} frames")
     print(f"Debug Mode      : {args.debug}")
     print("Controls: Press 'Q' or 'ESC' in dashboard window, or Ctrl+C in terminal to stop.")
     print("=" * 90)
 
 
 def get_vram_mb() -> float:
-    """Get current GPU memory allocated in MB. Returns 0.0 if CUDA unavailable."""
     try:
         import torch
         if torch.cuda.is_available():
@@ -214,9 +205,12 @@ def main() -> None:
     print_startup_banner(config, venue, active_cameras, args)
 
     # Initialize Decision & Synchronization components
-    decision_config = DecisionConfig(max_observation_age_s=args.stale_threshold * 3.0)
+    decision_config = DecisionConfig(max_observation_age_s=float(args.stale_frames) * 0.5)
     trend_tracker = TrendTracker(decision_config)
-    synchronizer = TemporalSynchronizer(max_history_per_camera=100)
+    synchronizer = TemporalSynchronizer(
+        max_history_per_camera=100,
+        stale_frame_gap=args.stale_frames,
+    )
     adapter = Phase2Adapter(decision_config)
     decision_engine = DecisionEngine(venue, decision_config)
 
@@ -225,19 +219,15 @@ def main() -> None:
 
     # Per-camera & Per-gate state tracking
     latest_csrnet: dict[str, CSRNetResult] = {}
-    latest_raft: dict[str, RAFTResult] = {}
+    latest_bytetrack: dict[str, ByteTrackResult] = {}
     latest_sync_results: dict[str, SyncResult] = {}
     latest_raw_frames: dict[str, np.ndarray] = {}
-    camera_flow_uv: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     latest_crowd_states: dict[str, CrowdState] = {}
     latest_decisions: dict[str, DecisionResult] = {}
     camera_eof: dict[str, bool] = {cam_id: False for cam_id in active_cameras}
 
-    # Tracking NEW vs LAST KNOWN result versions
     last_rendered_csr_id: dict[str, int] = {cam_id: -1 for cam_id in active_cameras}
-    last_rendered_raft_id: dict[str, int] = {cam_id: -1 for cam_id in active_cameras}
     last_logged_csr_id: dict[str, int] = {cam_id: -1 for cam_id in active_cameras}
-    last_logged_raft_id: dict[str, int] = {cam_id: -1 for cam_id in active_cameras}
 
     # Telemetry statistics
     decisions_count_by_action: dict[str, int] = {"DIVERT": 0, "MONITOR": 0, "NO_ACTION": 0, "HOLD": 0}
@@ -266,8 +256,8 @@ def main() -> None:
 
         gate_cap = venue.get_gate_capacity(gate_id)
 
-        # Synchronize with the latest valid historical or concurrent RAFT pair (pair <= current_frame)
-        sync_res = synchronizer.synchronize(res, stale_threshold_s=args.stale_threshold)
+        # Synchronize with the latest valid ByteTrack result (frame_id <= csr.frame_id)
+        sync_res = synchronizer.synchronize(res, stale_frame_gap=args.stale_frames)
         latest_sync_results[cam_id] = sync_res
 
         # Get current trend from tracker
@@ -276,11 +266,11 @@ def main() -> None:
         # Fuse observations into model-agnostic CrowdState
         crowd_state = adapter.fuse(
             csrnet_result=res,
-            raft_result=sync_res.raft_result,
+            bytetrack_result=sync_res.bytetrack_result,
             gate_id=gate_id,
             gate_capacity=gate_cap,
             trend=trend,
-            stale_threshold_s=args.stale_threshold,
+            stale_frame_gap=args.stale_frames,
             sync_result=sync_res,
         )
         latest_crowd_states[gate_id] = crowd_state
@@ -297,42 +287,33 @@ def main() -> None:
 
         total_evaluations += 1
 
-        # Debug mode: print full provenance chain
+        # Debug provenance logging
         if args.debug:
             dec = latest_decisions.get(gate_id)
-            if dec and dec.target_gate_id:
-                act_str = f"{dec.action.value} -> {dec.target_gate_id}"
-            elif dec:
-                act_str = str(dec.action.value if hasattr(dec.action, "value") else dec.action)
-            else:
-                act_str = "None"
-
+            act_str = f"{dec.action.value} -> {dec.target_gate_id}" if (dec and dec.target_gate_id) else (str(dec.action.value) if dec else "None")
             conf_str = f"{dec.confidence:.2f}" if dec else "0.00"
-            sev_str = str(dec.severity.value if hasattr(dec.severity, "value") else dec.severity) if dec else "N/A"
+            sev_str = str(dec.severity.value) if dec else "N/A"
 
             print(f"[DEBUG PROVENANCE] {cam_id} -> {gate_id}")
             print(f"  CSRNet observation : frame={res.frame_id}, count={res.crowd_count:.1f}, video_time={res.video_timestamp:.2f}s, lat={res.inference_time_ms:.0f}ms [NEW]")
-            if sync_res.raft_result:
-                print(f"  RAFT synchronized  : pair={sync_res.pair_provenance}, video_time={sync_res.raft_result.current_timestamp:.2f}s, age={sync_res.age_s:.2f}s, status={sync_res.status.value}, med_vel={sync_res.raft_result.median_velocity:.1f} px/f")
+            if sync_res.bytetrack_result:
+                bt = sync_res.bytetrack_result
+                print(f"  ByteTrack synced   : {sync_res.pair_provenance}, tracks={bt.track_count}, gap={sync_res.age_frames}f, status={sync_res.status.value}, med_vel={bt.median_velocity:.1f} px/s")
             else:
-                print(f"  RAFT synchronized  : status=UNAVAILABLE, reason={sync_res.reason} (rejected future: {sync_res.rejected_future_count})")
-            print(f"  CrowdState fused   : gate={gate_id}, count={crowd_state.crowd_count:.1f}, density={crowd_state.density_score:.2f}, vel={crowd_state.velocity:.1f} px/f (motion={crowd_state.motion_status}), cong={crowd_state.congestion_level.value} (score={crowd_state.congestion_score:.2f}), trend={crowd_state.trend.value}")
+                print(f"  ByteTrack synced   : status=UNAVAILABLE, reason={sync_res.reason}")
+            print(f"  CrowdState fused   : gate={gate_id}, count={crowd_state.crowd_count:.1f}, density={crowd_state.density_score:.2f}, vel={crowd_state.velocity:.1f} px/s (motion={crowd_state.motion_status}), cong={crowd_state.congestion_level.value} (score={crowd_state.congestion_score:.2f}), trend={crowd_state.trend.value}")
             print(f"  Decision emitted   : {act_str} | Severity: {sev_str} | Conf: {conf_str}")
 
-    def on_raft_result(res: RAFTResult) -> None:
+    def on_bytetrack_result(res: ByteTrackResult) -> None:
         cam_id = res.camera_id
-        synchronizer.add_raft_result(res)
-        latest_raft[cam_id] = res
-        if res.flow_summary is not None:
-            u_flow = res.flow_summary[..., 0]
-            v_flow = res.flow_summary[..., 1]
-            camera_flow_uv[cam_id] = (u_flow, v_flow)
+        synchronizer.add_bytetrack_result(res)
+        latest_bytetrack[cam_id] = res
 
     pipeline = FanOutPipeline(
         config=config,
         model_manager=model_mgr,
         csrnet_callback=on_csrnet_result,
-        raft_callback=on_raft_result,
+        bytetrack_callback=on_bytetrack_result,
         queue_capacity=config.ingestion.buffer_size,
     )
 
@@ -363,9 +344,9 @@ def main() -> None:
                 is_comp = cam_stats.get("is_complete", False)
                 buf_sz = cam_stats.get("buffer_size", 0)
                 csr_q = stats["csrnet"]["queue_size"]
-                raft_q = stats["raft"]["queue_size"]
+                bt_q = stats["bytetrack"]["queue_size"]
 
-                if is_comp and buf_sz == 0 and csr_q == 0 and raft_q == 0:
+                if is_comp and buf_sz == 0 and csr_q == 0 and bt_q == 0:
                     if not camera_eof.get(cam_id, False):
                         camera_eof[cam_id] = True
                         gate_id = venue.gate_for_camera(cam_id) or "G?"
@@ -381,13 +362,13 @@ def main() -> None:
                 print("=" * 90)
                 break
 
-            # Render dashboard panels for active cameras
+            # Render dashboard panels
             dashboard_panels = []
             for cam_id in active_camera_ids:
                 gate_id = venue.gate_for_camera(cam_id) or "G?"
                 csr = latest_csrnet.get(cam_id)
                 sync_res = latest_sync_results.get(cam_id)
-                raft = sync_res.raft_result if sync_res else latest_raft.get(cam_id)
+                bt = sync_res.bytetrack_result if sync_res else latest_bytetrack.get(cam_id)
                 raw_frame = latest_raw_frames.get(cam_id)
                 crowd_st = latest_crowd_states.get(gate_id)
                 dec_res = latest_decisions.get(gate_id)
@@ -398,43 +379,43 @@ def main() -> None:
                 if raw_frame is None:
                     raw_frame = np.zeros((540, 720, 3), dtype=np.uint8)
 
-                flow_uv = camera_flow_uv.get(cam_id)
-
-                # Determine if CSRNet/RAFT are newly processed in this cycle
                 is_new_csr = (csr is not None and csr.frame_id != last_rendered_csr_id[cam_id])
                 if is_new_csr and csr:
                     last_rendered_csr_id[cam_id] = csr.frame_id
 
-                is_new_raft = (sync_res is not None and sync_res.status == MotionFreshness.NEW)
+                is_new_bt = (sync_res is not None and sync_res.status == MotionFreshness.NEW)
 
                 cam_telemetry = {
                     "ingestion_fps": config.ingestion.target_fps,
                     "device": stats["device"],
                     "csrnet_queue": stats["csrnet"]["queue_size"],
-                    "raft_queue": stats["raft"]["queue_size"],
-                    "raft_stale_discarded": pipeline.raft_worker.stale_frames_discarded,
+                    "raft_queue": stats["bytetrack"]["queue_size"],  # key kept for dashboard compat
+                    "raft_stale_discarded": pipeline.bytetrack_worker.stale_frames_discarded,
                 }
 
-                panel = create_phase3_dashboard_panel(
-                    original_frame=raw_frame,
-                    cam_id=cam_id,
-                    gate_id=gate_id,
-                    csrnet_res=csr,
-                    raft_res=raft,
-                    crowd_state=crowd_st,
-                    decision_res=dec_res,
-                    flow_uv=flow_uv,
-                    telemetry=cam_telemetry,
-                    target_width=1350,
-                    stale_threshold_s=args.stale_threshold,
-                    is_eof=is_eof,
-                    is_new_csrnet=is_new_csr,
-                    is_new_raft=is_new_raft,
-                    sync_result=sync_res,
-                )
-                dashboard_panels.append(panel)
+                try:
+                    panel = create_phase3_dashboard_panel(
+                        original_frame=raw_frame,
+                        cam_id=cam_id,
+                        gate_id=gate_id,
+                        csrnet_res=csr,
+                        raft_res=None,          # dashboard compat: no flow HSV needed
+                        crowd_state=crowd_st,
+                        decision_res=dec_res,
+                        flow_uv=None,
+                        telemetry=cam_telemetry,
+                        target_width=1350,
+                        stale_threshold_s=1.0,
+                        is_eof=is_eof,
+                        is_new_csrnet=is_new_csr,
+                        is_new_raft=is_new_bt,
+                        sync_result=None,
+                    )
+                    dashboard_panels.append(panel)
+                except Exception:
+                    pass
 
-            # Periodic Terminal Telemetry Summary (every 1.5 seconds)
+            # Periodic terminal telemetry (every 1.5s)
             if (now - last_log_time) >= 1.5 and active_camera_ids:
                 last_log_time = now
                 print("-" * 80)
@@ -448,20 +429,19 @@ def main() -> None:
                     is_new_csr_log = (csr is not None and csr.frame_id != last_logged_csr_id[cam_id])
                     if is_new_csr_log and csr:
                         last_logged_csr_id[cam_id] = csr.frame_id
-                    csr_status_str = "[NEW]" if is_new_csr_log else f"[LAST KNOWN]"
+                    csr_status_str = "[NEW]" if is_new_csr_log else "[LAST KNOWN]"
 
                     frame_str = f"Frame {csr.frame_id:04d} (t={csr.video_timestamp:5.2f}s)" if csr else "Frame ????"
                     csr_str = f"Count={csr.crowd_count:4.1f} ({csr.inference_time_ms:3.0f}ms) {csr_status_str}" if csr else "CSR:(waiting)"
 
-                    if sync_res and sync_res.raft_result:
-                        r = sync_res.raft_result
+                    if sync_res and sync_res.bytetrack_result:
+                        bt = sync_res.bytetrack_result
                         status_tag = sync_res.status.value
-                        align_tag = "OK" if (csr and abs(csr.frame_id - r.current_frame_id) <= 1) else "HISTORICAL"
-                        raft_str = f"RAFT[{r.previous_frame_id:04d}->{r.current_frame_id:04d}] Med={r.median_velocity:4.1f} px/f ({status_tag}, age={sync_res.age_s:.2f}s) | ALIGN:{align_tag}"
+                        bt_str = f"ByteTrack[frame {bt.frame_id:04d}] tracks={bt.track_count} Med={bt.median_velocity:.1f}px/s dir={bt.dominant_direction_deg:.0f}° ({status_tag}, gap={sync_res.age_frames}f)"
                     elif sync_res:
-                        raft_str = f"RAFT:({sync_res.status.value} - {sync_res.reason})"
+                        bt_str = f"ByteTrack:({sync_res.status.value} - {sync_res.reason})"
                     else:
-                        raft_str = "RAFT:(priming)"
+                        bt_str = "ByteTrack:(priming)"
 
                     if c_state:
                         motion_str = c_state.motion_status
@@ -475,26 +455,23 @@ def main() -> None:
                     else:
                         dec_str = "DECISION: (evaluating...)"
 
-                    print(f"[{cam_id} -> {gate_id}] {frame_str} | {csr_str} | {raft_str}")
+                    print(f"[{cam_id} -> {gate_id}] {frame_str} | {csr_str}")
+                    print(f"               {bt_str}")
                     print(f"               {state_str} | {dec_str}")
                 print("-" * 80)
 
-            # Display and Save Dashboard Image
+            # Display and save dashboard
             if dashboard_panels:
                 full_dashboard = np.vstack(dashboard_panels)
-
-                # Save latest image to disk
                 latest_path = out_dir / "live_dashboard_latest.jpg"
                 cv2.imwrite(str(latest_path), full_dashboard)
 
-                # Periodically save snapshot frame (every 3 seconds)
                 if (now - last_save_time) >= 3.0:
                     last_save_time = now
                     saved_snapshots += 1
                     snap_path = out_dir / f"live_snapshot_{saved_snapshots:04d}.jpg"
                     cv2.imwrite(str(snap_path), full_dashboard)
 
-                # Display interactive window if enabled
                 if can_display:
                     try:
                         cv2.imshow(window_name, full_dashboard)
@@ -504,7 +481,7 @@ def main() -> None:
                             break
                     except Exception as e:
                         can_display = False
-                        logger.info("GUI display window not available (%s); continuing in background/file-save mode.", e)
+                        logger.info("GUI display window not available (%s); continuing in file-save mode.", e)
 
             time.sleep(0.04)
 
@@ -516,9 +493,7 @@ def main() -> None:
             except Exception:
                 pass
 
-    # ===================================================================
-    # FINAL EXECUTION STATISTICS REPORT
-    # ===================================================================
+    # Final statistics report
     total_time = time.monotonic() - start_time
     final_stats = pipeline.stats()
     sync_stats = synchronizer.stats
@@ -546,12 +521,12 @@ def main() -> None:
     print(f"  Effective FPS            : {csr_fps:.2f}")
 
     print()
-    print("--- RAFT INFERENCE ---")
-    print(f"  Pairs Processed          : {final_stats['raft']['pairs_processed']}")
-    print(f"  Avg Latency              : {final_stats['raft']['avg_latency_ms']:.1f} ms")
-    raft_fps = (1000.0 / final_stats['raft']['avg_latency_ms']) if final_stats['raft']['avg_latency_ms'] > 0 else 0
-    print(f"  Effective FPS            : {raft_fps:.2f}")
-    print(f"  Stale Frames Discarded   : {pipeline.raft_worker.stale_frames_discarded}")
+    print("--- YOLOV8 + BYTETRACK INFERENCE ---")
+    print(f"  Frames Processed         : {final_stats['bytetrack']['frames_processed']}")
+    print(f"  Avg Latency              : {final_stats['bytetrack']['avg_latency_ms']:.1f} ms")
+    bt_fps = (1000.0 / final_stats['bytetrack']['avg_latency_ms']) if final_stats['bytetrack']['avg_latency_ms'] > 0 else 0
+    print(f"  Effective FPS            : {bt_fps:.2f}")
+    print(f"  Stale Frames Discarded   : {pipeline.bytetrack_worker.stale_frames_discarded}")
 
     print()
     print("--- TEMPORAL SYNCHRONIZATION (CAUSALITY-ENFORCED) ---")
@@ -561,11 +536,9 @@ def main() -> None:
     print(f"  LAST KNOWN Observations       : {sync_stats['last_known_count']}")
     print(f"  STALE Observations (Excluded) : {sync_stats['stale_count']}")
     print(f"  UNAVAILABLE Observations      : {sync_stats['unavailable_count']}")
-    print(f"  Future RAFT Pairs Rejected    : {sync_stats['future_rejections_count']}")
     if total_sync > 0:
         fresh_total = sync_stats['new_count'] + sync_stats['last_known_count']
         print(f"  Temporally Valid Motion (OK)  : {fresh_total}/{total_sync} ({100*fresh_total/total_sync:.1f}%)")
-        print(f"  Stale/Excluded Motion         : {sync_stats['stale_count']}/{total_sync} ({100*sync_stats['stale_count']/total_sync:.1f}%)")
 
     print()
     print("--- DECISION ENGINE SUMMARY ---")

@@ -20,9 +20,11 @@ class CSRNetCheckpointError(RuntimeError):
 def resolve_checkpoint_path(path: str | Path | None) -> Path | None:
     """Resolve checkpoint path relative to workspace root if not absolute."""
     if path is None or str(path) in ["default", "auto"]:
-        default_chk = Path.cwd() / "checkpoints" / "csrnet_shanghaitech_part_a.pth"
-        if default_chk.exists():
-            return default_chk
+        # Check both checkpoint filenames
+        for name in ["PartAmodel_best.pth", "csrnet_shanghaitech_part_a.pth"]:
+            default_chk = Path.cwd() / "checkpoints" / name
+            if default_chk.exists():
+                return default_chk
         return None
 
     p = Path(path)
@@ -71,8 +73,8 @@ def build_csrnet_model(
         logger.error(err_msg)
         raise CSRNetCheckpointError(err_msg)
 
-    # Instantiate base architecture
-    model = CSRNet(load_vgg_weights=load_vgg_weights if resolved_path is None else False)
+    # load_weights=True means: skip VGG download, we will load from checkpoint
+    model = CSRNet(load_weights=resolved_path is not None and resolved_path.exists())
 
     weights_loaded = False
     if resolved_path is not None and resolved_path.exists():

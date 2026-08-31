@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Any
 
 from crowd_management.ingestion.frame_buffer import FrameBuffer
@@ -16,17 +15,17 @@ logger = logging.getLogger(__name__)
 class FrameDistributor:
     """Consumes FramePackets from one or more upstream buffers and broadcasts them
 
-    to dedicated downstream queues (CSRNet and RAFT) without queue contention.
+    to dedicated downstream queues (CSRNet and ByteTrack) without queue contention.
     """
 
     def __init__(
         self,
         csrnet_buffer_size: int = 15,
-        raft_buffer_size: int = 15,
+        bytetrack_buffer_size: int = 15,
         drop_policy: str = "oldest",
     ) -> None:
         self.csrnet_queue = FrameBuffer(capacity=csrnet_buffer_size, drop_policy=drop_policy)
-        self.raft_queue = FrameBuffer(capacity=raft_buffer_size, drop_policy=drop_policy)
+        self.bytetrack_queue = FrameBuffer(capacity=bytetrack_buffer_size, drop_policy=drop_policy)
         self.drop_policy = drop_policy
 
         self._lock = threading.Lock()
@@ -40,7 +39,7 @@ class FrameDistributor:
             return self._packets_routed
 
     def dispatch(self, packet: FramePacket) -> None:
-        """Broadcast a single FramePacket to both CSRNet and RAFT queues.
+        """Broadcast a single FramePacket to both CSRNet and ByteTrack queues.
 
         Args:
             packet: Input FramePacket from ingestion stream.
@@ -54,8 +53,8 @@ class FrameDistributor:
         # Push to CSRNet queue
         self.csrnet_queue.put(packet, block=False)
 
-        # Push to RAFT queue
-        self.raft_queue.put(packet, block=False)
+        # Push to ByteTrack queue
+        self.bytetrack_queue.put(packet, block=False)
 
         with self._lock:
             self._packets_routed += 1
@@ -67,7 +66,7 @@ class FrameDistributor:
         with self._lock:
             self._closed = True
         self.csrnet_queue.close()
-        self.raft_queue.close()
+        self.bytetrack_queue.close()
 
     def stats(self) -> dict[str, Any]:
         """Return real-time diagnostic statistics for monitoring."""
@@ -78,7 +77,7 @@ class FrameDistributor:
                 "csrnet_queue_size": len(self.csrnet_queue),
                 "csrnet_frames_produced": self.csrnet_queue.frames_produced,
                 "csrnet_frames_dropped": self.csrnet_queue.frames_dropped,
-                "raft_queue_size": len(self.raft_queue),
-                "raft_frames_produced": self.raft_queue.frames_produced,
-                "raft_frames_dropped": self.raft_queue.frames_dropped,
+                "bytetrack_queue_size": len(self.bytetrack_queue),
+                "bytetrack_frames_produced": self.bytetrack_queue.frames_produced,
+                "bytetrack_frames_dropped": self.bytetrack_queue.frames_dropped,
             }

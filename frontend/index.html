@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crowd Management — Live Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- ── Top Navbar ─────────────────────────────────────── -->
+  <header class="navbar">
+    <div class="navbar-left">
+      <div class="logo">
+        <span class="logo-icon">⬡</span>
+        <span class="logo-text">CrowdGuard <span class="logo-sub">AI</span></span>
+      </div>
+      <div class="pipeline-badge" id="pipelineBadge">
+        <span class="pulse-dot"></span>
+        <span id="pipelineStatus">Connecting…</span>
+      </div>
+    </div>
+    <div class="navbar-center">
+      <span class="nav-title">Real-Time Crowd Intelligence Dashboard</span>
+    </div>
+    <div class="navbar-right">
+      <div class="stat-pill">
+        <span class="pill-label">Device</span>
+        <span class="pill-value mono" id="deviceBadge">—</span>
+      </div>
+      <div class="stat-pill">
+        <span class="pill-label">Uptime</span>
+        <span class="pill-value mono" id="uptimeBadge">00:00</span>
+      </div>
+      <div class="stat-pill">
+        <span class="pill-label">Evaluations</span>
+        <span class="pill-value mono" id="evalBadge">0</span>
+      </div>
+      <div class="clock mono" id="clockDisplay">—</div>
+    </div>
+  </header>
+
+  <!-- ── Main content ───────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Camera panels grid -->
+    <section class="cameras-grid" id="camerasGrid">
+      <!-- Populated by JS -->
+    </section>
+
+    <!-- Decision summary bar -->
+    <section class="decision-bar" id="decisionBar">
+      <!-- Populated by JS -->
+    </section>
+
+    <!-- System telemetry footer -->
+    <section class="telemetry-row" id="telemetryRow">
+      <!-- Populated by JS -->
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

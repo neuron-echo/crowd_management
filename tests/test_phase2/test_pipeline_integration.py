@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from crowd_management.config.schemas import AppConfig, CameraConfig, DatasetConfig, IngestionConfig
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 from crowd_management.models.manager import ModelManager
 from crowd_management.pipeline.fanout_pipeline import FanOutPipeline
 
@@ -36,21 +36,20 @@ def test_fanout_pipeline_integration(mock_video: Path):
     )
 
     csr_results: list[CSRNetResult] = []
-    raft_results: list[RAFTResult] = []
+    bt_results: list[ByteTrackResult] = []
 
     # Use fast lightweight resolutions for integration testing
     model_mgr = ModelManager(
         device="cpu",
         csrnet_resolution=(64, 64),
-        raft_model_size="small",
-        raft_resolution=(64, 64),
+        bytetrack_model_path="yolov8n.pt",   # smallest model for test speed
     )
 
     pipeline = FanOutPipeline(
         config=cfg,
         model_manager=model_mgr,
         csrnet_callback=lambda r: csr_results.append(r),
-        raft_callback=lambda r: raft_results.append(r),
+        bytetrack_callback=lambda r: bt_results.append(r),
         queue_capacity=10,
     )
 

@@ -1,23 +1,37 @@
-"""CSRNet crowd density inference engine."""
+"""CSRNet crowd density inference engine — paper-accurate multi-scale inference.
+
+Inference method matches csrnetb.py (original paper pipeline):
+  - Scales: [0.7, 1.0, 1.3]
+  - Scale correction: raw_count / (s * s)
+  - Final count: mean across scales
+"""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
 import torch
+import torchvision.transforms as T
+from PIL import Image
 
 from crowd_management.ingestion.frame_packet import FramePacket
 from crowd_management.models.contracts import CSRNetResult
 from crowd_management.models.csrnet.architecture import CSRNet
 from crowd_management.models.csrnet.weights import build_csrnet_model, resolve_checkpoint_path
 
+# Multi-scale factors — identical to original csrnetb.py
+_SCALES = [0.7, 1.0, 1.3]
+
 
 class CSRNetInference:
-    """Persistent inference worker for CSRNet crowd density estimation."""
+    """Persistent inference worker for CSRNet crowd density estimation.
+
+    Uses the same multi-scale inference as the original paper (csrnetb.py):
+      scales=[0.7, 1.0, 1.3], scale correction count/(s*s), final=mean.
+    """
 
     def __init__(
         self,
@@ -32,7 +46,7 @@ class CSRNetInference:
         else:
             self.device = device
 
-        self.inference_resolution = inference_resolution  # (width, height) or None for full
+        self.inference_resolution = inference_resolution  # (width, height) optional override
         self.model_name = model_name
         self.resolved_checkpoint = resolve_checkpoint_path(checkpoint_path)
         self.checkpoint_identifier = (
@@ -42,74 +56,87 @@ class CSRNetInference:
         self.model: CSRNet = build_csrnet_model(
             checkpoint_path=checkpoint_path,
             device=self.device,
-            load_vgg_weights=True,
             strict_checkpoint=strict_checkpoint,
         )
 
-        # ImageNet mean and std for standard VGG-16 normalization
-        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        self._std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        # Transform — identical to csrnetb.py
+        self._transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-    def preprocess(self, bgr_frame: np.ndarray) -> tuple[torch.Tensor, tuple[int, int]]:
-        """Preprocess BGR numpy frame into normalized PyTorch tensor.
+    def _multiscale_count(
+        self, pil_img: Image.Image
+    ) -> tuple[float, np.ndarray]:
+        """Run multi-scale inference identical to csrnetb.py.
 
         Returns:
-            Tuple of (tensor of shape (1, 3, H, W), (orig_w, orig_h))
+            (final_crowd_count, density_map_at_scale_1)
         """
-        orig_h, orig_w = bgr_frame.shape[:2]
+        orig_w, orig_h = pil_img.size
+        counts = []
+        density_at_full_scale: np.ndarray | None = None
 
-        if self.inference_resolution is not None:
-            proc_w, proc_h = self.inference_resolution
-            # Ensure dimensions are divisible by 8 for 3 max-pooling layers
-            proc_w = max(8, (proc_w // 8) * 8)
-            proc_h = max(8, (proc_h // 8) * 8)
-            frame_resized = cv2.resize(bgr_frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            # Pad or crop to multiple of 8 if necessary
-            proc_w = max(8, (orig_w // 8) * 8)
-            proc_h = max(8, (orig_h // 8) * 8)
-            if proc_w != orig_w or proc_h != orig_h:
-                frame_resized = cv2.resize(bgr_frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                frame_resized = bgr_frame
+        for s in _SCALES:
+            new_w = int(orig_w * s)
+            new_h = int(orig_h * s)
+            # Enforce multiple of 8 (3 max-pool layers → 8× downsampling)
+            new_w = new_w - new_w % 8
+            new_h = new_h - new_h % 8
 
-        # BGR -> RGB
-        rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        normalized = (rgb - self._mean) / self._std
+            scaled_img = pil_img.resize((new_w, new_h))
+            tensor = self._transform(scaled_img).unsqueeze(0).to(self.device)
 
-        # HWC -> CHW -> NCHW
-        tensor = torch.from_numpy(normalized.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
-        return tensor, (orig_w, orig_h)
+            with torch.no_grad():
+                density_tensor = self.model(tensor)
+
+            density_np = density_tensor.squeeze().cpu().numpy().astype(np.float32)
+            if density_np.ndim == 0:
+                density_np = np.array([[float(density_np)]], dtype=np.float32)
+
+            raw_count = float(np.sum(density_np))
+            # Scale correction — same as csrnetb.py: count / (s * s)
+            corrected_count = raw_count / (s * s)
+            counts.append(corrected_count)
+
+            # Keep the density map at scale 1.0 for visualization
+            if abs(s - 1.0) < 1e-6:
+                density_at_full_scale = density_np
+
+        final_count = float(np.mean(counts))
+        final_count = max(0.0, final_count)
+
+        if density_at_full_scale is None:
+            density_at_full_scale = np.zeros((orig_h // 8, orig_w // 8), dtype=np.float32)
+
+        return final_count, density_at_full_scale
 
     def estimate(self, packet: FramePacket) -> CSRNetResult:
-        """Run CSRNet density estimation on a single FramePacket.
+        """Run multi-scale CSRNet density estimation on a single FramePacket.
 
         Args:
             packet: Input FramePacket from ingestion stream.
 
         Returns:
-            Immutable CSRNetResult object.
+            Immutable CSRNetResult with crowd_count from multi-scale inference.
         """
         start_time = time.perf_counter()
 
-        tensor, (orig_w, orig_h) = self.preprocess(packet.frame)
+        bgr_frame = packet.frame
+        orig_h, orig_w = bgr_frame.shape[:2]
 
-        with torch.no_grad():
-            density_tensor = self.model(tensor)
+        # Convert BGR → RGB → PIL (same pipeline as csrnetb.py)
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
 
-        # density_tensor is (1, 1, H // 8, W // 8)
-        density_map = density_tensor.squeeze().cpu().numpy().astype(np.float32)
-        if density_map.ndim == 0:
-            density_map = np.array([[float(density_map)]], dtype=np.float32)
-        elif density_map.ndim == 1:
-            density_map = density_map.reshape(1, -1)
+        # Optional resolution override (resize before multi-scale)
+        if self.inference_resolution is not None:
+            proc_w, proc_h = self.inference_resolution
+            proc_w = max(8, (proc_w // 8) * 8)
+            proc_h = max(8, (proc_h // 8) * 8)
+            pil_img = pil_img.resize((proc_w, proc_h))
 
-        # Crowd count is strictly the integral (sum) of the density map
-        crowd_count = float(np.sum(density_map))
-
-        # Clamp tiny negative numerical noise to zero
-        crowd_count = max(0.0, crowd_count)
-
+        crowd_count, density_map = self._multiscale_count(pil_img)
         inference_time_ms = (time.perf_counter() - start_time) * 1000.0
 
         map_h, map_w = density_map.shape[:2]

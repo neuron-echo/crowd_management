@@ -1,5 +1,6 @@
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.pyc
@@ -85,6 +86,16 @@ checkpoints/
 saved_models/
 model_weights/
 
+# ─── YOLOv8 / Ultralytics ────────────────────────────────────────────────────
+# YOLO model weights are downloaded automatically on first run (do not commit)
+yolov8*.pt
+yolov9*.pt
+yolov10*.pt
+yolov11*.pt
+yolo11*.pt
+runs/
+ultralytics/
+
 # ─── Dataset (HAJJv2) ─────────────────────────────────────────────────────────
 # Raw video files and annotations are large binary assets, not tracked in git.
 # Download / symlink them locally according to README instructions.
@@ -94,6 +105,9 @@ HAJJv2.Dataset/
 *.mov
 *.mkv
 
+# ─── CSRNet source files / uploads ────────────────────────────────────────────
+csrnet files/
+
 # ─── Pipeline outputs ─────────────────────────────────────────────────────────
 outputs/
 
@@ -102,11 +116,22 @@ outputs/
 logs/
 
 # ─── Environment / secrets ────────────────────────────────────────────────────
+# Copy .env.example to .env and fill in your local paths.
+# NEVER commit .env — it contains local paths and may contain secrets.
+# .env.example IS safe to commit (it contains only placeholder values).
 .env
-.env.*
-*.env
+.env.local
+.env.*.local
 secrets.yaml
 secrets.yml
+
+# ─── Node / Frontend ──────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp/
+.pnp.js
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
 *.tmp

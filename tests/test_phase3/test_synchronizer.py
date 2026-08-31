@@ -1,13 +1,14 @@
-"""Unit and regression tests for TemporalSynchronizer and temporal causality rules."""
+"""Unit and regression tests for TemporalSynchronizer with ByteTrack results."""
 
 from __future__ import annotations
 
 import time
+
 import numpy as np
 import pytest
 
 from crowd_management.adapters.synchronizer import MotionFreshness, SyncResult, TemporalSynchronizer
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 
 
 def make_csr(
@@ -35,34 +36,26 @@ def make_csr(
     )
 
 
-def make_raft(
+def make_bytetrack(
     camera_id: str = "cam_01",
-    previous_frame_id: int = 50,
-    current_frame_id: int = 51,
-    previous_timestamp: float = 9.07,
-    current_timestamp: float = 9.26,
+    frame_id: int = 50,
     median_velocity: float = 3.1,
-) -> RAFTResult:
-    return RAFTResult(
+) -> ByteTrackResult:
+    return ByteTrackResult(
         camera_id=camera_id,
-        previous_frame_id=previous_frame_id,
-        current_frame_id=current_frame_id,
-        previous_source_frame_index=previous_frame_id * 5,
-        current_source_frame_index=current_frame_id * 5,
-        previous_timestamp=previous_timestamp,
-        current_timestamp=current_timestamp,
-        flow_width=512,
-        flow_height=384,
-        average_velocity=median_velocity,
+        frame_id=frame_id,
+        source_frame_index=frame_id * 5,
+        video_timestamp=frame_id * 0.18,
+        wall_clock_timestamp=time.time(),
+        track_count=8,
         median_velocity=median_velocity,
-        max_velocity=8.0,
-        velocity_variance=1.0,
+        average_velocity=median_velocity,
         dominant_direction_deg=90.0,
         flow_consistency=0.85,
         active_motion_ratio=0.5,
         motion_confidence=0.9,
-        inference_time_ms=1300.0,
-        model_name="RAFT",
+        inference_time_ms=25.0,
+        model_name="yolov8l.pt",
         device="cuda",
         result_timestamp=time.time(),
     )
@@ -70,119 +63,106 @@ def make_raft(
 
 class TestTemporalSynchronizer:
 
-    def test_specific_user_scenario_rejection_of_future_pair(self):
-        """CSR frame = 56, available RAFT pairs: 37->38, 57->58, 50->51 -> Expected: 50->51."""
+    def test_future_frame_rejected(self):
+        """ByteTrack frame > CSR frame must be rejected."""
         sync = TemporalSynchronizer()
 
-        # Add pairs in any order
-        sync.add_raft_result(make_raft(previous_frame_id=37, current_frame_id=38, previous_timestamp=6.66, current_timestamp=6.85))
-        sync.add_raft_result(make_raft(previous_frame_id=57, current_frame_id=58, previous_timestamp=10.37, current_timestamp=10.56))
-        sync.add_raft_result(make_raft(previous_frame_id=50, current_frame_id=51, previous_timestamp=9.07, current_timestamp=9.26))
+        sync.add_bytetrack_result(make_bytetrack(frame_id=38))   # past
+        sync.add_bytetrack_result(make_bytetrack(frame_id=58))   # future
+        sync.add_bytetrack_result(make_bytetrack(frame_id=51))   # valid most-recent
 
-        csr = make_csr(frame_id=56, video_timestamp=10.19)
-        res = sync.synchronize(csr, stale_threshold_s=1.5)
-
-        assert res.raft_result is not None
-        assert res.raft_result.previous_frame_id == 50
-        assert res.raft_result.current_frame_id == 51
-        assert res.is_valid_motion is True
-        assert res.rejected_future_count == 1
-        assert abs(res.age_s - (10.19 - 9.26)) < 1e-4
-
-    def test_specific_user_scenario_concurrent_pair(self):
-        """CSR frame = 56, available: 37->38, 55->56 -> Expected: 55->56."""
-        sync = TemporalSynchronizer()
-
-        sync.add_raft_result(make_raft(previous_frame_id=37, current_frame_id=38, previous_timestamp=6.66, current_timestamp=6.85))
-        sync.add_raft_result(make_raft(previous_frame_id=55, current_frame_id=56, previous_timestamp=10.00, current_timestamp=10.19))
-
-        csr = make_csr(frame_id=56, video_timestamp=10.19)
-        res = sync.synchronize(csr, stale_threshold_s=1.0)
-
-        assert res.raft_result is not None
-        assert res.raft_result.previous_frame_id == 55
-        assert res.raft_result.current_frame_id == 56
-        assert res.is_valid_motion is True
-        assert res.age_s == 0.0
-
-    def test_specific_user_scenario_only_future_pair_available(self):
-        """CSR frame = 56, available: 57->58 -> Expected: UNAVAILABLE."""
-        sync = TemporalSynchronizer()
-
-        sync.add_raft_result(make_raft(previous_frame_id=57, current_frame_id=58, previous_timestamp=10.37, current_timestamp=10.56))
-
-        csr = make_csr(frame_id=56, video_timestamp=10.19)
-        res = sync.synchronize(csr, stale_threshold_s=1.0)
-
-        assert res.raft_result is None
-        assert res.status == MotionFreshness.UNAVAILABLE
-        assert res.is_valid_motion is False
-        assert res.reason == "FUTURE_PAIR_REJECTED"
-        assert res.rejected_future_count == 1
-
-    def test_no_raft_available(self):
-        sync = TemporalSynchronizer()
-        csr = make_csr(frame_id=10, video_timestamp=2.0)
+        csr = make_csr(frame_id=56)
         res = sync.synchronize(csr)
 
-        assert res.raft_result is None
+        assert res.bytetrack_result is not None
+        assert res.bytetrack_result.frame_id == 51
+        assert res.is_valid_motion is True
+
+    def test_concurrent_frame_selected(self):
+        """ByteTrack at same frame_id as CSR is valid and preferred."""
+        sync = TemporalSynchronizer()
+
+        sync.add_bytetrack_result(make_bytetrack(frame_id=38))
+        sync.add_bytetrack_result(make_bytetrack(frame_id=56))   # concurrent
+
+        csr = make_csr(frame_id=56)
+        res = sync.synchronize(csr)
+
+        assert res.bytetrack_result is not None
+        assert res.bytetrack_result.frame_id == 56
+        assert res.is_valid_motion is True
+        assert res.age_frames == 0
+
+    def test_only_future_available_gives_unavailable(self):
+        """Only future ByteTrack available -> UNAVAILABLE."""
+        sync = TemporalSynchronizer()
+
+        sync.add_bytetrack_result(make_bytetrack(frame_id=58))  # future only
+
+        csr = make_csr(frame_id=56)
+        res = sync.synchronize(csr)
+
+        assert res.bytetrack_result is None
+        assert res.status == MotionFreshness.UNAVAILABLE
+        assert res.is_valid_motion is False
+
+    def test_no_bytetrack_available(self):
+        """No ByteTrack results at all -> UNAVAILABLE."""
+        sync = TemporalSynchronizer()
+        csr = make_csr(frame_id=10)
+        res = sync.synchronize(csr)
+
+        assert res.bytetrack_result is None
         assert res.status == MotionFreshness.UNAVAILABLE
         assert res.is_valid_motion is False
 
     def test_multi_camera_isolation(self):
+        """cam_01 queries must not see cam_02 results."""
         sync = TemporalSynchronizer()
-        sync.add_raft_result(make_raft(camera_id="cam_02", previous_frame_id=10, current_frame_id=11, current_timestamp=2.0))
+        sync.add_bytetrack_result(make_bytetrack(camera_id="cam_02", frame_id=11))
 
-        # Query cam_01 -> should not see cam_02
-        csr1 = make_csr(camera_id="cam_01", frame_id=15, video_timestamp=3.0)
+        csr1 = make_csr(camera_id="cam_01", frame_id=15)
         res1 = sync.synchronize(csr1)
         assert res1.status == MotionFreshness.UNAVAILABLE
 
-        # Query cam_02 -> should see cam_02
-        csr2 = make_csr(camera_id="cam_02", frame_id=15, video_timestamp=3.0)
-        res2 = sync.synchronize(csr2, stale_threshold_s=1.5)
+        csr2 = make_csr(camera_id="cam_02", frame_id=15)
+        res2 = sync.synchronize(csr2)
         assert res2.status == MotionFreshness.NEW
-        assert res2.raft_result.camera_id == "cam_02"
-
-    def test_consecutive_frame_requirement(self):
-        sync = TemporalSynchronizer()
-        # Non-consecutive pair (50->52)
-        bad_raft = make_raft(previous_frame_id=50, current_frame_id=52)
-        sync.add_raft_result(bad_raft)
-
-        csr = make_csr(frame_id=55, video_timestamp=10.0)
-        res = sync.synchronize(csr)
-        assert res.status == MotionFreshness.UNAVAILABLE
+        assert res2.bytetrack_result.camera_id == "cam_02"
 
     def test_new_vs_last_known_semantics(self):
+        """Same ByteTrack frame used twice -> second is LAST_KNOWN."""
         sync = TemporalSynchronizer()
-        sync.add_raft_result(make_raft(previous_frame_id=10, current_frame_id=11, current_timestamp=2.0))
+        sync.add_bytetrack_result(make_bytetrack(frame_id=11))
 
-        # First query for frame 12 -> NEW
-        csr12 = make_csr(frame_id=12, video_timestamp=2.2)
-        res1 = sync.synchronize(csr12, stale_threshold_s=1.0)
+        # First query -> NEW
+        res1 = sync.synchronize(make_csr(frame_id=12))
         assert res1.status == MotionFreshness.NEW
         assert res1.is_valid_motion is True
 
-        # Second query for frame 13 (no new RAFT pair arrived yet) -> LAST_KNOWN
-        csr13 = make_csr(frame_id=13, video_timestamp=2.4)
-        res2 = sync.synchronize(csr13, stale_threshold_s=1.0)
+        # Second query (no new ByteTrack arrived) -> LAST_KNOWN
+        res2 = sync.synchronize(make_csr(frame_id=13))
         assert res2.status == MotionFreshness.LAST_KNOWN
         assert res2.is_valid_motion is True
-        assert abs(res2.age_s - 0.4) < 1e-4
+        assert res2.age_frames == 2
 
-        # Third query for frame 25 (video timestamp 5.0 -> age = 3.0s > 1.0s) -> STALE
-        csr25 = make_csr(frame_id=25, video_timestamp=5.0)
-        res3 = sync.synchronize(csr25, stale_threshold_s=1.0)
-        assert res3.status == MotionFreshness.STALE
-        assert res3.is_valid_motion is False
-        assert abs(res3.age_s - 3.0) < 1e-4
+    def test_stale_by_frame_gap(self):
+        """Large frame gap beyond threshold -> STALE."""
+        sync = TemporalSynchronizer(stale_frame_gap=10)
+        sync.add_bytetrack_result(make_bytetrack(frame_id=10))
+
+        csr = make_csr(frame_id=25)  # gap = 15 > threshold 10
+        res = sync.synchronize(csr)
+
+        assert res.status == MotionFreshness.STALE
+        assert res.is_valid_motion is False
+        assert res.age_frames == 15
 
 
 class TestCallbackRegression:
 
     def test_act_str_defined_in_decision_formatting(self):
-        """Regression test ensuring decision action string formatting does not raise NameError."""
+        """Regression: decision action string formatting must not raise NameError."""
         from crowd_management.decision.contracts import ActionType, CongestionLevel, DecisionResult
 
         dec = DecisionResult(

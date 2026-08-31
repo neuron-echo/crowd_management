@@ -1,15 +1,16 @@
-"""Tests for Phase 2 Adapter boundary."""
+"""Tests for Phase 2 Adapter boundary (CSRNet + ByteTrack -> CrowdState)."""
 
 from __future__ import annotations
 
 import time
+
 import numpy as np
 import pytest
 
 from crowd_management.adapters.phase2_adapter import Phase2Adapter
 from crowd_management.decision.config import DecisionConfig
 from crowd_management.decision.contracts import CongestionLevel, Trend
-from crowd_management.models.contracts import CSRNetResult, RAFTResult
+from crowd_management.models.contracts import ByteTrackResult, CSRNetResult
 
 
 @pytest.fixture
@@ -43,32 +44,28 @@ def make_mock_csrnet_result(
     )
 
 
-def make_mock_raft_result(
+def make_mock_bytetrack_result(
     camera_id: str = "cam_01",
+    frame_id: int = 10,
     median_velocity: float = 2.5,
     timestamp: float | None = None,
-) -> RAFTResult:
+) -> ByteTrackResult:
     ts = timestamp if timestamp is not None else time.time()
-    return RAFTResult(
+    return ByteTrackResult(
         camera_id=camera_id,
-        previous_frame_id=9,
-        current_frame_id=10,
-        previous_source_frame_index=45,
-        current_source_frame_index=50,
-        previous_timestamp=1.8,
-        current_timestamp=2.0,
-        flow_width=512,
-        flow_height=384,
-        average_velocity=2.5,
+        frame_id=frame_id,
+        source_frame_index=frame_id * 5,
+        video_timestamp=2.0,
+        wall_clock_timestamp=ts,
+        track_count=8,
         median_velocity=median_velocity,
-        max_velocity=8.0,
-        velocity_variance=1.0,
+        average_velocity=median_velocity,
         dominant_direction_deg=90.0,
         flow_consistency=0.85,
         active_motion_ratio=0.5,
         motion_confidence=0.8,
-        inference_time_ms=50.0,
-        model_name="RAFT",
+        inference_time_ms=25.0,
+        model_name="yolov8l.pt",
         device="cpu",
         result_timestamp=ts,
     )
@@ -78,11 +75,11 @@ class TestPhase2Adapter:
 
     def test_full_fusion(self, adapter: Phase2Adapter):
         csr = make_mock_csrnet_result(camera_id="cam_01", crowd_count=400.0)
-        raft = make_mock_raft_result(camera_id="cam_01", median_velocity=1.5)
+        bt = make_mock_bytetrack_result(camera_id="cam_01", frame_id=10, median_velocity=1.5)
 
         state = adapter.fuse(
             csrnet_result=csr,
-            raft_result=raft,
+            bytetrack_result=bt,
             gate_id="G1",
             gate_capacity=500,
             trend=Trend.INCREASING,
@@ -97,11 +94,11 @@ class TestPhase2Adapter:
         assert state.congestion_score > 0.5
 
     def test_missing_density_observation(self, adapter: Phase2Adapter):
-        raft = make_mock_raft_result(camera_id="cam_01", median_velocity=3.0)
+        bt = make_mock_bytetrack_result(camera_id="cam_01", frame_id=10, median_velocity=3.0)
 
         state = adapter.fuse(
             csrnet_result=None,
-            raft_result=raft,
+            bytetrack_result=bt,
             gate_id="G1",
             gate_capacity=500,
         )
@@ -118,7 +115,7 @@ class TestPhase2Adapter:
 
         state = adapter.fuse(
             csrnet_result=csr,
-            raft_result=None,
+            bytetrack_result=None,
             gate_id="G1",
             gate_capacity=500,
         )
@@ -131,44 +128,30 @@ class TestPhase2Adapter:
 
     def test_cross_camera_rejection(self, adapter: Phase2Adapter):
         csr = make_mock_csrnet_result(camera_id="cam_01")
-        raft = make_mock_raft_result(camera_id="cam_02")
+        bt = make_mock_bytetrack_result(camera_id="cam_02")
 
         with pytest.raises(ValueError, match="Cannot fuse results from different cameras"):
             adapter.fuse(
                 csrnet_result=csr,
-                raft_result=raft,
+                bytetrack_result=bt,
                 gate_id="G1",
                 gate_capacity=500,
             )
 
-    def test_stale_raft_excluded_from_motion(self, adapter: Phase2Adapter):
-        """When RAFT result is older than stale threshold (video time), motion is excluded."""
-        csr = make_mock_csrnet_result(camera_id="cam_01", crowd_count=400.0)
-        # CSRNet is at video timestamp 2.0s
-        # RAFT is at video timestamp 0.5s -> age = 1.5s > threshold (1.0s)
-        density = np.zeros((48, 64), dtype=np.float32)
-        raft_stale = RAFTResult(
-            camera_id="cam_01",
-            previous_frame_id=2,
-            current_frame_id=3,
-            previous_source_frame_index=10,
-            current_source_frame_index=15,
-            previous_timestamp=0.3,
-            current_timestamp=0.5,
-            flow_width=512, flow_height=384,
-            average_velocity=4.0, median_velocity=4.0, max_velocity=8.0,
-            velocity_variance=1.0, dominant_direction_deg=90.0,
-            flow_consistency=0.8, active_motion_ratio=0.5, motion_confidence=0.9,
-            inference_time_ms=40.0, model_name="RAFT", device="cpu",
-            result_timestamp=100.0,
+    def test_stale_bytetrack_excluded_from_motion(self, adapter: Phase2Adapter):
+        """When ByteTrack frame gap > stale threshold, motion is excluded."""
+        csr = make_mock_csrnet_result(camera_id="cam_01", crowd_count=400.0, frame_id=50)
+        # ByteTrack is at frame 5 -> gap = 45 > threshold (10)
+        bt_stale = make_mock_bytetrack_result(
+            camera_id="cam_01", frame_id=5, median_velocity=4.0
         )
 
         state = adapter.fuse(
             csrnet_result=csr,
-            raft_result=raft_stale,
+            bytetrack_result=bt_stale,
             gate_id="G1",
             gate_capacity=500,
-            stale_threshold_s=1.0,
+            stale_frame_gap=10,
         )
 
         assert state.gate_id == "G1"
@@ -178,40 +161,23 @@ class TestPhase2Adapter:
         assert state.velocity == 0.0
         assert state.motion_status == "STALE"
         assert state.is_motion_fresh is False
-        assert state.raft_result_age_s == 1.5
 
-    def test_fresh_raft_included_in_motion(self, adapter: Phase2Adapter):
-        """When RAFT result is within threshold (video time), motion is valid and active."""
-        csr = make_mock_csrnet_result(camera_id="cam_01", crowd_count=400.0)
-        # CSRNet is at video timestamp 2.0s
-        # RAFT is at video timestamp 1.8s -> age = 0.2s <= threshold (1.0s)
-        raft_fresh = RAFTResult(
-            camera_id="cam_01",
-            previous_frame_id=9,
-            current_frame_id=10,
-            previous_source_frame_index=45,
-            current_source_frame_index=50,
-            previous_timestamp=1.6,
-            current_timestamp=1.8,
-            flow_width=512, flow_height=384,
-            average_velocity=3.2, median_velocity=3.2, max_velocity=8.0,
-            velocity_variance=1.0, dominant_direction_deg=90.0,
-            flow_consistency=0.85, active_motion_ratio=0.5, motion_confidence=0.9,
-            inference_time_ms=40.0, model_name="RAFT", device="cpu",
-            result_timestamp=100.0,
+    def test_fresh_bytetrack_included_in_motion(self, adapter: Phase2Adapter):
+        """When ByteTrack frame gap is within threshold, motion is valid."""
+        csr = make_mock_csrnet_result(camera_id="cam_01", crowd_count=400.0, frame_id=10)
+        bt_fresh = make_mock_bytetrack_result(
+            camera_id="cam_01", frame_id=9, median_velocity=3.2   # gap=1 < threshold
         )
 
         state = adapter.fuse(
             csrnet_result=csr,
-            raft_result=raft_fresh,
+            bytetrack_result=bt_fresh,
             gate_id="G1",
             gate_capacity=500,
-            stale_threshold_s=1.0,
+            stale_frame_gap=10,
         )
 
         assert state.has_motion is True
         assert state.velocity == 3.2
         assert state.motion_status in ("NEW", "OK")
         assert state.is_motion_fresh is True
-        assert abs(state.raft_result_age_s - 0.2) < 1e-5
-

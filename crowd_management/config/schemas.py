@@ -39,17 +39,34 @@ class CSRNetModelConfig(BaseModel):
     inference_resolution: tuple[int, int] | None = (720, 540)
 
 
-class RAFTModelConfig(BaseModel):
+class ByteTrackModelConfig(BaseModel):
+    """Configuration for YOLOv8 + ByteTrack motion estimation model."""
+
     model_config = {"protected_namespaces": ()}
+
     enabled: bool = True
-    model_size: Literal["small", "large"] = "large"
-    inference_resolution: tuple[int, int] | None = (512, 384)
+    model_path: str = Field(
+        default="yolov8l.pt",
+        description="YOLOv8 weights file. Downloaded automatically on first run if not present.",
+    )
+    tracker_config: str = Field(
+        default="bytetrack.yaml",
+        description="ByteTrack YAML config bundled with ultralytics.",
+    )
+    confidence_threshold: float = Field(
+        default=0.3, ge=0.0, le=1.0,
+        description="Minimum detection confidence for a person to be tracked.",
+    )
+    motion_threshold_px: float = Field(
+        default=2.0, gt=0,
+        description="Minimum displacement (px/sec) for a track to count as 'moving'.",
+    )
 
 
 class ModelsConfig(BaseModel):
     device: Literal["auto", "cpu", "cuda"] = "auto"
     csrnet: CSRNetModelConfig = Field(default_factory=CSRNetModelConfig)
-    raft: RAFTModelConfig = Field(default_factory=RAFTModelConfig)
+    bytetrack: ByteTrackModelConfig = Field(default_factory=ByteTrackModelConfig)
 
 
 class AppConfig(BaseModel):
@@ -64,4 +81,3 @@ class AppConfig(BaseModel):
         if not enabled_cameras:
             raise ValueError("At least one enabled camera must be defined")
         return self
-

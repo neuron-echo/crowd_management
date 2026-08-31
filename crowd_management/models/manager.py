@@ -9,8 +9,8 @@ from typing import Any
 import torch
 
 from crowd_management.config.schemas import ModelsConfig
+from crowd_management.models.bytetrack.infer import ByteTrackInference
 from crowd_management.models.csrnet.infer import CSRNetInference
-from crowd_management.models.raft.infer import RAFTInference
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +23,12 @@ class ModelManager:
         device: str | None = None,
         csrnet_checkpoint: str | Path | None = None,
         csrnet_resolution: tuple[int, int] | None = (720, 540),
-        raft_model_size: str = "large",
-        raft_resolution: tuple[int, int] | None = (512, 384),
+        bytetrack_model_path: str = "yolov8l.pt",
+        bytetrack_tracker_config: str = "bytetrack.yaml",
+        bytetrack_confidence: float = 0.3,
+        bytetrack_motion_threshold: float = 2.0,
         enable_csrnet: bool = True,
-        enable_raft: bool = True,
+        enable_bytetrack: bool = True,
         strict_checkpoint: bool = True,
         models_config: ModelsConfig | None = None,
     ) -> None:
@@ -36,9 +38,11 @@ class ModelManager:
             enable_csrnet = models_config.csrnet.enabled
             csrnet_checkpoint = csrnet_checkpoint or models_config.csrnet.checkpoint_path
             csrnet_resolution = csrnet_resolution or models_config.csrnet.inference_resolution
-            enable_raft = models_config.raft.enabled
-            raft_model_size = raft_model_size or models_config.raft.model_size
-            raft_resolution = raft_resolution or models_config.raft.inference_resolution
+            enable_bytetrack = models_config.bytetrack.enabled
+            bytetrack_model_path = models_config.bytetrack.model_path
+            bytetrack_tracker_config = models_config.bytetrack.tracker_config
+            bytetrack_confidence = models_config.bytetrack.confidence_threshold
+            bytetrack_motion_threshold = models_config.bytetrack.motion_threshold_px
 
         if device is None or device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,7 +52,7 @@ class ModelManager:
         self._print_startup_device_report()
 
         self._csrnet: CSRNetInference | None = None
-        self._raft: RAFTInference | None = None
+        self._bytetrack: ByteTrackInference | None = None
 
         if enable_csrnet:
             logger.info("Instantiating CSRNet engine (resolution=%s)...", csrnet_resolution)
@@ -59,12 +63,17 @@ class ModelManager:
                 strict_checkpoint=strict_checkpoint,
             )
 
-        if enable_raft:
-            logger.info("Instantiating RAFT optical flow engine (size=%s, resolution=%s)...", raft_model_size, raft_resolution)
-            self._raft = RAFTInference(
+        if enable_bytetrack:
+            logger.info(
+                "Instantiating ByteTrack engine (model=%s tracker=%s)...",
+                bytetrack_model_path, bytetrack_tracker_config,
+            )
+            self._bytetrack = ByteTrackInference(
+                model_path=bytetrack_model_path,
+                tracker_config=bytetrack_tracker_config,
+                confidence_threshold=bytetrack_confidence,
+                motion_threshold_px=bytetrack_motion_threshold,
                 device=self.device,
-                model_size=raft_model_size,
-                inference_resolution=raft_resolution,
             )
 
     def _print_startup_device_report(self) -> None:
@@ -73,11 +82,11 @@ class ModelManager:
         report = (
             f"\n{'=' * 60}\n"
             f"DEVICE HARDWARE REPORT:\n"
-            f"    Configured device : {self.device}\n"
-            f"    CUDA available    : {cuda_avail}\n"
-            f"    GPU Name          : {gpu_name}\n"
-            f"    CSRNet device     : {self.device}\n"
-            f"    RAFT device       : {self.device}\n"
+            f"    Configured device   : {self.device}\n"
+            f"    CUDA available      : {cuda_avail}\n"
+            f"    GPU Name            : {gpu_name}\n"
+            f"    CSRNet device       : {self.device}\n"
+            f"    ByteTrack device    : {self.device}\n"
             f"{'=' * 60}"
         )
         print(report)
@@ -90,18 +99,17 @@ class ModelManager:
         return self._csrnet
 
     @property
-    def raft(self) -> RAFTInference:
-        if self._raft is None:
-            raise RuntimeError("RAFT is not enabled on this ModelManager")
-        return self._raft
+    def bytetrack(self) -> ByteTrackInference:
+        if self._bytetrack is None:
+            raise RuntimeError("ByteTrack is not enabled on this ModelManager")
+        return self._bytetrack
 
     @property
     def device_info(self) -> dict[str, Any]:
-        info: dict[str, Any] = {
+        return {
             "device": self.device,
             "cuda_available": torch.cuda.is_available(),
             "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
             "csrnet_enabled": self._csrnet is not None,
-            "raft_enabled": self._raft is not None,
+            "bytetrack_enabled": self._bytetrack is not None,
         }
-        return info

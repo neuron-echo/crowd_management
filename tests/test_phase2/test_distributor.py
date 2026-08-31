@@ -28,15 +28,15 @@ def sample_packet() -> FramePacket:
 
 
 def test_distributor_broadcast(sample_packet: FramePacket):
-    dist = FrameDistributor(csrnet_buffer_size=5, raft_buffer_size=5)
+    dist = FrameDistributor(csrnet_buffer_size=5, bytetrack_buffer_size=5)
     dist.dispatch(sample_packet)
 
     assert len(dist.csrnet_queue) == 1
-    assert len(dist.raft_queue) == 1
+    assert len(dist.bytetrack_queue) == 1
     assert dist.packets_routed == 1
 
     p1 = dist.csrnet_queue.get(block=False)
-    p2 = dist.raft_queue.get(block=False)
+    p2 = dist.bytetrack_queue.get(block=False)
 
     assert p1.frame_id == sample_packet.frame_id
     assert p2.frame_id == sample_packet.frame_id
@@ -44,7 +44,7 @@ def test_distributor_broadcast(sample_packet: FramePacket):
 
 
 def test_distributor_overflow_bounded():
-    dist = FrameDistributor(csrnet_buffer_size=2, raft_buffer_size=2, drop_policy="oldest")
+    dist = FrameDistributor(csrnet_buffer_size=2, bytetrack_buffer_size=2, drop_policy="oldest")
 
     for i in range(5):
         pkt = FramePacket(
@@ -62,12 +62,12 @@ def test_distributor_overflow_bounded():
         dist.dispatch(pkt)
 
     assert len(dist.csrnet_queue) <= 2
-    assert len(dist.raft_queue) <= 2
+    assert len(dist.bytetrack_queue) <= 2
     assert dist.csrnet_queue.frames_dropped >= 3
 
 
 def test_distributor_multicamera_routing():
-    dist = FrameDistributor(csrnet_buffer_size=10, raft_buffer_size=10)
+    dist = FrameDistributor(csrnet_buffer_size=10, bytetrack_buffer_size=10)
 
     for cam in ["cam_01", "cam_02"]:
         pkt = FramePacket(
