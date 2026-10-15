@@ -5,8 +5,9 @@
 ───────────────────────────────────────────────────────────── */
 
 const CAMERA_META = {
-  cam_01: { label: "Camera 01", gateLabel: "Gate North" },
-  cam_02: { label: "Camera 02", gateLabel: "Gate East"  },
+  cam_01: { label: "Camera 01", gateLabel: "Gate North (G1)" },
+  cam_02: { label: "Camera 02", gateLabel: "Gate East (G2)"  },
+  cam_03: { label: "Camera 03", gateLabel: "Gate West (G3)"  },
 };
 
 // ── State ──────────────────────────────────────────────────────
@@ -433,6 +434,7 @@ function connect() {
 
       bootstrapDOM(snap);
       updateTelemetry(snap);
+      renderAdvisories(snap.advisories || []);
 
       Object.entries(snap.cameras || {}).forEach(([camId, cam]) => {
         updateCamera(camId, cam);
@@ -452,6 +454,53 @@ function connect() {
   };
 
   ws.onerror = () => ws.close();
+}
+
+// ── Advisory Panel renderer ────────────────────────────────────
+function renderAdvisories(advisories) {
+  const list  = $("advisoryList");
+  const count = $("advisoryCount");
+  if (!list) return;
+
+  if (!advisories || advisories.length === 0) {
+    list.innerHTML = `<div style="padding:16px 20px;color:var(--text-muted);font-size:13px;">No active advisories.</div>`;
+    if (count) count.textContent = "0 advisories";
+    return;
+  }
+
+  if (count) {
+    const emg = advisories.filter(a => a.severity === "EMERGENCY").length;
+    count.textContent = `${advisories.length} active${emg ? ` · ${emg} EMERGENCY` : ""}`;
+    count.style.background = emg ? "rgba(239,68,68,0.2)" : "rgba(99,102,241,0.2)";
+    count.style.color       = emg ? "#f87171" : "#a5b4fc";
+    count.style.borderColor = emg ? "rgba(239,68,68,0.4)" : "rgba(99,102,241,0.3)";
+  }
+
+  // Only re-render if content changed (avoid flicker)
+  const key = advisories.map(a => a.rule_id + a.gate_id + a.severity).join("|");
+  if (list.dataset.lastKey === key) return;
+  list.dataset.lastKey = key;
+
+  list.innerHTML = advisories.map(adv => {
+    const ts = adv.timestamp
+      ? new Date(adv.timestamp * 1000).toLocaleTimeString("en-GB", { hour12: false })
+      : "—";
+    return `
+      <div class="advisory-card adv-${adv.severity}">
+        <div class="advisory-stripe"></div>
+        <div class="advisory-body">
+          <div class="advisory-row-top">
+            <span class="adv-severity-badge">${adv.severity}</span>
+            <span class="adv-gate-badge">${adv.gate_id}</span>
+            <span class="adv-title">${adv.title}</span>
+          </div>
+          <div class="adv-description">${adv.description}</div>
+          <div class="adv-action-label">Recommended Action</div>
+          <div class="adv-action">${adv.action}</div>
+        </div>
+        <div class="adv-timestamp">${ts}</div>
+      </div>`;
+  }).join("");
 }
 
 // ── Start ──────────────────────────────────────────────────────

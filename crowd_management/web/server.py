@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from crowd_management.web.state import dashboard_state
+from crowd_management.web.advisory import generate_advisories
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
@@ -80,6 +81,14 @@ async def status():
     return dashboard_state.snapshot()
 
 
+@app.get("/api/advisories")
+async def advisories():
+    """Return current rule-based organisational advisories."""
+    snap = dashboard_state.snapshot()
+    ads  = generate_advisories(snap.get("cameras", {}))
+    return {"advisories": [a.to_dict() for a in ads], "count": len(ads)}
+
+
 # ── WebSocket broadcast ───────────────────────────────────────────────────────
 
 _ws_clients: list[WebSocket] = []
@@ -93,6 +102,8 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             await asyncio.sleep(0.5)
             snap = dashboard_state.snapshot()
+            ads  = generate_advisories(snap.get("cameras", {}))
+            snap["advisories"] = [a.to_dict() for a in ads]
             # strip non-serialisable keys
             payload = json.dumps(snap, default=str)
             await ws.send_text(payload)

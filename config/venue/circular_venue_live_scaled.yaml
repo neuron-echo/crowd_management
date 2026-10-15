@@ -32,3 +32,9 @@ venue:
       capacity: 50
       position_index: 1
       camera_id: cam_02
+
+    - gate_id: G3
+      name: Gate West (Secondary Target)
+      capacity: 45
+      position_index: 2
+      camera_id: cam_03

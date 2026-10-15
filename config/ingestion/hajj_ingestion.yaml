@@ -33,3 +33,9 @@ cameras:
     source_type: video
     source: video samples/5.mp4
     enabled: true
+
+  - camera_id: cam_03
+    name: Video Sample 3
+    source_type: video
+    source: video samples/3.mp4
+    enabled: true

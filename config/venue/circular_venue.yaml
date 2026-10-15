@@ -29,3 +29,9 @@ venue:
       capacity: 600
       position_index: 1
       camera_id: cam_02
+
+    - gate_id: G3
+      name: Gate West
+      capacity: 550
+      position_index: 2
+      camera_id: cam_03
